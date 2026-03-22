@@ -1,0 +1,25 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace file
+go.work
+
+# Database files
+data.db
+data.db.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
