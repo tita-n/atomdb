@@ -8,12 +8,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/user/atomdb/internal/atom"
-	"github.com/user/atomdb/internal/index"
-	"github.com/user/atomdb/internal/store"
+	"github.com/tita-n/atomdb/internal/atom"
+	"github.com/tita-n/atomdb/internal/index"
+	"github.com/tita-n/atomdb/internal/store"
 )
 
-// Run dispatches CLI arguments to the appropriate command.
 func Run(s *store.AtomStore, args []string) error {
 	if len(args) == 0 {
 		printHelp()
@@ -53,8 +52,6 @@ func Run(s *store.AtomStore, args []string) error {
 	}
 }
 
-// cmdSet handles: set <entity> <attribute> <value> <type>
-// Empty string values are supported: set test:1 empty "" string
 func cmdSet(s *store.AtomStore, args []string) error {
 	if len(args) < 3 {
 		return fmt.Errorf("usage: set <entity> <attribute> <value> <type>")
@@ -67,17 +64,12 @@ func cmdSet(s *store.AtomStore, args []string) error {
 	var valueType string
 
 	if len(args) == 3 {
-		// Format: set entity attribute type (empty value)
-		// Or: set entity attribute value (missing type)
-		// We need at least 4 args. If 3, treat last as type with empty value.
 		rawValue = ""
 		valueType = args[2]
 	} else if len(args) == 4 {
 		rawValue = args[2]
 		valueType = args[3]
 	} else {
-		// More than 4 args: value might be split by shell
-		// Last arg is type, everything in between is value
 		rawValue = strings.Join(args[2:len(args)-1], " ")
 		valueType = args[len(args)-1]
 	}
@@ -99,7 +91,6 @@ func cmdSet(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-// cmdGet handles: get <entity> <attribute>
 func cmdGet(s *store.AtomStore, args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: get <entity> <attribute>")
@@ -124,7 +115,6 @@ func cmdGet(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-// cmdGetAll handles: getall <entity>
 func cmdGetAll(s *store.AtomStore, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: getall <entity>")
@@ -138,7 +128,6 @@ func cmdGetAll(s *store.AtomStore, args []string) error {
 		return nil
 	}
 
-	// Sort attribute names for consistent output
 	names := make([]string, 0, len(attrs))
 	for name := range attrs {
 		names = append(names, name)
@@ -153,27 +142,16 @@ func cmdGetAll(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-// cmdQuery handles compound queries:
-//
-//	query attribute op value
-//	query attribute op value AND attribute op value
-//	query attribute op value OR attribute op value
-//
-// Operators: ==, !=, >, <, >=, <=
-// Uses B-Tree index when available, falls back to full scan.
-// Shell note: use quotes for operators, e.g. query age ">" 25
 func cmdQuery(s *store.AtomStore, args []string) error {
 	if len(args) < 3 {
 		return fmt.Errorf("usage: query <attribute> <operator> <value> [AND|OR ...]")
 	}
 
-	// Parse conditions separated by AND/OR
 	conditions := parseConditions(args)
 	if len(conditions) == 0 {
 		return fmt.Errorf("no valid conditions found")
 	}
 
-	// Execute each condition
 	var resultSets [][]*atom.Atom
 	for _, cond := range conditions {
 		results, err := executeCondition(s, cond)
@@ -183,9 +161,7 @@ func cmdQuery(s *store.AtomStore, args []string) error {
 		resultSets = append(resultSets, results)
 	}
 
-	// Combine results using the logic operator from the last condition
-	// (all conditions between queries share the same logic in this simple parser)
-	logic := "AND" // default
+	logic := "AND"
 	for _, cond := range conditions {
 		if cond.Logic != "" {
 			logic = cond.Logic
@@ -205,7 +181,6 @@ func cmdQuery(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-// cmdExplain shows the query execution plan.
 func cmdExplain(s *store.AtomStore, args []string) error {
 	if len(args) < 3 {
 		return fmt.Errorf("usage: explain <attribute> <operator> <value>")
@@ -233,8 +208,6 @@ func cmdExplain(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-// cmdDelete handles: delete <entity> <attribute>
-// Checks existence before deleting.
 func cmdDelete(s *store.AtomStore, args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: delete <entity> <attribute>")
@@ -243,7 +216,6 @@ func cmdDelete(s *store.AtomStore, args []string) error {
 	entity := args[0]
 	attribute := args[1]
 
-	// Check existence first
 	if !s.Exists(entity, attribute) {
 		fmt.Printf("Not found: %s.%s\n", entity, attribute)
 		return nil
@@ -257,8 +229,6 @@ func cmdDelete(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-// cmdSearch handles: search <attribute> contains <word>
-// Full-text search using inverted index.
 func cmdSearch(s *store.AtomStore, args []string) error {
 	if len(args) < 3 {
 		return fmt.Errorf("usage: search <attribute> contains <word>")
@@ -284,7 +254,6 @@ func cmdSearch(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-// cmdIndex handles: index list | index rebuild
 func cmdIndex(s *store.AtomStore, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: index <list|rebuild>")
@@ -314,7 +283,6 @@ func cmdIndex(s *store.AtomStore, args []string) error {
 	}
 }
 
-// cmdStats shows store statistics.
 func cmdStats(s *store.AtomStore) error {
 	stats := s.Stats()
 
@@ -331,7 +299,6 @@ func cmdStats(s *store.AtomStore) error {
 	return nil
 }
 
-// cmdCompact handles: compact
 func cmdCompact(s *store.AtomStore) error {
 	if err := s.Compact(); err != nil {
 		return err
@@ -340,16 +307,13 @@ func cmdCompact(s *store.AtomStore) error {
 	return nil
 }
 
-// --- Query condition parsing ---
-
 type condition struct {
 	Attribute string
 	Operator  string
 	Value     string
-	Logic     string // "AND", "OR", or "" for first/only
+	Logic     string
 }
 
-// parseConditions splits args like [age, >, 25, AND, city, ==, Lagos] into conditions.
 func parseConditions(args []string) []condition {
 	var conditions []condition
 	current := condition{}
@@ -386,20 +350,17 @@ func parseConditions(args []string) []condition {
 	return conditions
 }
 
-// executeCondition runs a single query condition, trying index first.
 func executeCondition(s *store.AtomStore, cond condition) ([]*atom.Atom, error) {
 	if !isValidOperator(cond.Operator) {
 		return nil, fmt.Errorf("unsupported operator %q: use ==, !=, >, <, >=, <=", cond.Operator)
 	}
 
-	// Try index first for ==, >, <, >=, <=
 	if cond.Operator == "==" {
 		if indexed := s.QueryIndexed(cond.Attribute, cond.Value); indexed != nil {
 			return indexed, nil
 		}
 	}
 
-	// Range queries via index
 	if cond.Operator == ">" || cond.Operator == ">=" || cond.Operator == "<" || cond.Operator == "<=" {
 		var op index.RangeOp
 		switch cond.Operator {
@@ -417,7 +378,6 @@ func executeCondition(s *store.AtomStore, cond condition) ([]*atom.Atom, error) 
 		}
 	}
 
-	// Fall back to scan
 	searchValue := cond.Value
 	results := s.Query(cond.Attribute, func(a *atom.Atom) bool {
 		aFloat, aErr := toFloat64(a.Value)
@@ -434,7 +394,6 @@ func executeCondition(s *store.AtomStore, cond condition) ([]*atom.Atom, error) 
 	return results, nil
 }
 
-// combineResults merges result sets based on AND/OR logic.
 func combineResults(sets [][]*atom.Atom, primaryLogic string) []*atom.Atom {
 	if len(sets) == 0 {
 		return nil
@@ -443,21 +402,17 @@ func combineResults(sets [][]*atom.Atom, primaryLogic string) []*atom.Atom {
 		return sets[0]
 	}
 
-	// Use primary logic to combine all sets
 	if strings.ToUpper(primaryLogic) == "OR" {
 		return unionAtoms(sets)
 	}
-	// Default to AND
 	return intersectAtoms(sets)
 }
 
-// intersectAtoms returns atoms from the first set whose entity appears in ALL sets.
 func intersectAtoms(sets [][]*atom.Atom) []*atom.Atom {
 	if len(sets) == 0 {
 		return nil
 	}
 
-	// For each set, collect the set of entities
 	entitySets := make([]map[string]bool, len(sets))
 	for i, set := range sets {
 		entities := make(map[string]bool)
@@ -467,7 +422,6 @@ func intersectAtoms(sets [][]*atom.Atom) []*atom.Atom {
 		entitySets[i] = entities
 	}
 
-	// Find entities that appear in ALL sets
 	commonEntities := make(map[string]bool)
 	for e := range entitySets[0] {
 		inAll := true
@@ -482,7 +436,6 @@ func intersectAtoms(sets [][]*atom.Atom) []*atom.Atom {
 		}
 	}
 
-	// Return results from the first set that match common entities
 	seen := make(map[string]bool)
 	var result []*atom.Atom
 	for _, a := range sets[0] {
@@ -497,7 +450,6 @@ func intersectAtoms(sets [][]*atom.Atom) []*atom.Atom {
 	return result
 }
 
-// unionAtoms returns all unique atoms across all sets.
 func unionAtoms(sets [][]*atom.Atom) []*atom.Atom {
 	seen := make(map[string]bool)
 	var result []*atom.Atom
@@ -513,8 +465,6 @@ func unionAtoms(sets [][]*atom.Atom) []*atom.Atom {
 	}
 	return result
 }
-
-// --- Value parsing and comparison ---
 
 func parseValue(raw, valueType string) (interface{}, error) {
 	switch strings.ToLower(valueType) {
@@ -630,8 +580,6 @@ func printHelp() {
 	fmt.Println("Types: string, number, boolean, ref, timestamp")
 	fmt.Println()
 	fmt.Println("Examples:")
-	fmt.Println("  query age > 25")
-	fmt.Println("  query age > 25 AND city == Lagos")
-	fmt.Println("  query name == \"Ayo Adeleke\"")
-	fmt.Println("  search name contains Ayo")
+	fmt.Println("  query age \">\" 25")
+	fmt.Println("  query age \">\" 25 AND city == Lagos")
 }

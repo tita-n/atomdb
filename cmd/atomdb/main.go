@@ -7,8 +7,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/user/atomdb/cli"
-	"github.com/user/atomdb/internal/store"
+	"github.com/tita-n/atomdb/cli"
+	"github.com/tita-n/atomdb/internal/store"
 )
 
 const defaultDBPath = "data.db"

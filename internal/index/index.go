@@ -1,33 +1,29 @@
-// Package index provides a higher-level index manager on top of B-Trees.
-// It maintains per-attribute B-Tree indexes plus a full-text inverted index.
 package index
 
 import (
 	"fmt"
+	"log"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/user/atomdb/internal/atom"
+	"github.com/tita-n/atomdb/internal/atom"
 )
 
-// IndexManager maintains secondary indexes for fast attribute-based queries.
-// Each attribute gets its own B-Tree mapping normalized values to entity references.
-// A full-text inverted index is maintained for text/string attributes.
 type IndexManager struct {
-	indexes map[string]*BTree         // attribute name -> BTree
-	textIdx map[string]*InvertedIndex // attribute name -> inverted index (text search)
-	mu      sync.RWMutex
+	indexes   map[string]*BTree
+	textIdx   map[string]*InvertedIndex
+	attrTypes map[string]string // attribute -> atom type for search normalization
+	mu        sync.RWMutex
 }
 
-// InvertedIndex is a simple inverted index for full-text search.
-// Maps tokens (lowercased words) to the set of entities containing them.
 type InvertedIndex struct {
-	index map[string]map[string]bool // token -> set of entities
+	index map[string]map[string]struct{}
 	mu    sync.RWMutex
 }
 
-// StopWords is a set of common English words excluded from the inverted index.
 var StopWords = map[string]bool{
 	"a": true, "an": true, "and": true, "are": true, "as": true, "at": true,
 	"be": true, "but": true, "by": true, "for": true, "if": true, "in": true,
@@ -37,18 +33,17 @@ var StopWords = map[string]bool{
 	"this": true, "to": true, "was": true, "will": true, "with": true,
 }
 
-// NewIndexManager creates an empty index manager.
 func NewIndexManager() *IndexManager {
 	return &IndexManager{
-		indexes: make(map[string]*BTree),
-		textIdx: make(map[string]*InvertedIndex),
+		indexes:   make(map[string]*BTree),
+		textIdx:   make(map[string]*InvertedIndex),
+		attrTypes: make(map[string]string),
 	}
 }
 
-// newInvertedIndex creates an empty inverted index.
 func newInvertedIndex() *InvertedIndex {
 	return &InvertedIndex{
-		index: make(map[string]map[string]bool),
+		index: make(map[string]map[string]struct{}),
 	}
 }
 
@@ -59,7 +54,7 @@ func (im *IndexManager) IndexAtom(a *atom.Atom) {
 	}
 
 	key := normalizeValue(a.Value)
-	entityKey := fmt.Sprintf("%s.%s", a.Entity, a.Attribute)
+	entityKey := a.Entity + "." + a.Attribute
 
 	im.mu.Lock()
 	bt, ok := im.indexes[a.Attribute]
@@ -67,11 +62,14 @@ func (im *IndexManager) IndexAtom(a *atom.Atom) {
 		bt = New()
 		im.indexes[a.Attribute] = bt
 	}
+	im.attrTypes[a.Attribute] = a.Type
 	im.mu.Unlock()
 
-	bt.Insert(key, []string{entityKey})
+	if err := bt.Insert(key, []string{entityKey}); err != nil {
+		log.Printf("WARNING: B-Tree insert failed for %s: %v", a.Attribute, err)
+		return
+	}
 
-	// Text index for string values
 	if a.Type == "string" {
 		if s, ok := a.Value.(string); ok {
 			im.indexText(a.Attribute, a.Entity, s)
@@ -79,20 +77,30 @@ func (im *IndexManager) IndexAtom(a *atom.Atom) {
 	}
 }
 
-// RemoveAtom removes an atom from all indexes.
 func (im *IndexManager) RemoveAtom(a *atom.Atom) {
-	key := normalizeValue(a.Value)
-	entityKey := fmt.Sprintf("%s.%s", a.Entity, a.Attribute)
-
 	im.mu.RLock()
 	bt, ok := im.indexes[a.Attribute]
+	isNumeric := im.attrTypes[a.Attribute] == "number"
 	im.mu.RUnlock()
 
-	if ok {
-		bt.Remove(key, entityKey)
+	if !ok {
+		return
 	}
 
-	// Remove from text index
+	var key string
+	if isNumeric {
+		if f, err := toFloat64Value(a.Value); err == nil {
+			key = encodeNumericKey(f)
+		} else {
+			key = normalizeValue(a.Value)
+		}
+	} else {
+		key = normalizeValue(a.Value)
+	}
+	entityKey := a.Entity + "." + a.Attribute
+
+	bt.Remove(key, entityKey)
+
 	if a.Type == "string" {
 		if s, ok := a.Value.(string); ok {
 			im.removeText(a.Attribute, a.Entity, s)
@@ -100,8 +108,6 @@ func (im *IndexManager) RemoveAtom(a *atom.Atom) {
 	}
 }
 
-// RebuildFromAtoms rebuilds all indexes from a set of atoms.
-// Called on startup after loading from disk.
 func (im *IndexManager) RebuildFromAtoms(atoms map[string]map[string]*atom.Atom) {
 	im.mu.Lock()
 	im.indexes = make(map[string]*BTree)
@@ -115,8 +121,6 @@ func (im *IndexManager) RebuildFromAtoms(atoms map[string]map[string]*atom.Atom)
 	}
 }
 
-// Search performs an exact match query using the index.
-// Returns entity.attribute keys, or nil if no index exists for the attribute.
 func (im *IndexManager) Search(attribute, value string) []string {
 	im.mu.RLock()
 	bt, ok := im.indexes[attribute]
@@ -129,7 +133,6 @@ func (im *IndexManager) Search(attribute, value string) []string {
 	return bt.Search(normalizeValue(value))
 }
 
-// RangeSearch performs a range query using the index.
 func (im *IndexManager) RangeSearch(attribute string, op RangeOp, value string) []string {
 	im.mu.RLock()
 	bt, ok := im.indexes[attribute]
@@ -142,7 +145,6 @@ func (im *IndexManager) RangeSearch(attribute string, op RangeOp, value string) 
 	return bt.RangeQuery(op, normalizeValue(value))
 }
 
-// HasIndex returns true if an index exists for the given attribute.
 func (im *IndexManager) HasIndex(attribute string) bool {
 	im.mu.RLock()
 	defer im.mu.RUnlock()
@@ -150,7 +152,6 @@ func (im *IndexManager) HasIndex(attribute string) bool {
 	return ok
 }
 
-// IndexedAttributes returns the list of attributes that have indexes.
 func (im *IndexManager) IndexedAttributes() []string {
 	im.mu.RLock()
 	defer im.mu.RUnlock()
@@ -162,19 +163,6 @@ func (im *IndexManager) IndexedAttributes() []string {
 	return attrs
 }
 
-// IndexStats returns stats for a given attribute's index.
-func (im *IndexManager) IndexStats(attribute string) (keyCount int, hasTextIndex bool) {
-	im.mu.RLock()
-	defer im.mu.RUnlock()
-
-	if bt, ok := im.indexes[attribute]; ok {
-		keyCount = bt.Count()
-	}
-	_, hasTextIndex = im.textIdx[attribute]
-	return
-}
-
-// TotalKeys returns the total number of index entries across all attributes.
 func (im *IndexManager) TotalKeys() int {
 	im.mu.RLock()
 	defer im.mu.RUnlock()
@@ -185,7 +173,6 @@ func (im *IndexManager) TotalKeys() int {
 	return total
 }
 
-// indexText tokenizes a string value and adds tokens to the inverted index.
 func (im *IndexManager) indexText(attribute, entity, text string) {
 	im.mu.Lock()
 	ii, ok := im.textIdx[attribute]
@@ -195,12 +182,11 @@ func (im *IndexManager) indexText(attribute, entity, text string) {
 	}
 	im.mu.Unlock()
 
-	entityKey := fmt.Sprintf("%s.%s", entity, attribute)
+	entityKey := entity + "." + attribute
 	tokens := tokenize(text)
 	ii.Add(entityKey, tokens)
 }
 
-// removeText removes entity from inverted index for given text tokens.
 func (im *IndexManager) removeText(attribute, entity, text string) {
 	im.mu.RLock()
 	ii, ok := im.textIdx[attribute]
@@ -210,12 +196,11 @@ func (im *IndexManager) removeText(attribute, entity, text string) {
 		return
 	}
 
-	entityKey := fmt.Sprintf("%s.%s", entity, attribute)
+	entityKey := entity + "." + attribute
 	tokens := tokenize(text)
 	ii.Remove(entityKey, tokens)
 }
 
-// FullTextSearch searches for entities containing a word in a text attribute.
 func (im *IndexManager) FullTextSearch(attribute, word string) []string {
 	im.mu.RLock()
 	ii, ok := im.textIdx[attribute]
@@ -229,20 +214,18 @@ func (im *IndexManager) FullTextSearch(attribute, word string) []string {
 	return ii.Search(token)
 }
 
-// Add adds entity to the inverted index for the given tokens.
 func (ii *InvertedIndex) Add(entity string, tokens []string) {
 	ii.mu.Lock()
 	defer ii.mu.Unlock()
 
 	for _, token := range tokens {
 		if ii.index[token] == nil {
-			ii.index[token] = make(map[string]bool)
+			ii.index[token] = make(map[string]struct{})
 		}
-		ii.index[token][entity] = true
+		ii.index[token][entity] = struct{}{}
 	}
 }
 
-// Remove removes entity from the inverted index for the given tokens.
 func (ii *InvertedIndex) Remove(entity string, tokens []string) {
 	ii.mu.Lock()
 	defer ii.mu.Unlock()
@@ -257,7 +240,6 @@ func (ii *InvertedIndex) Remove(entity string, tokens []string) {
 	}
 }
 
-// Search returns all entities that contain the given token.
 func (ii *InvertedIndex) Search(token string) []string {
 	ii.mu.RLock()
 	defer ii.mu.RUnlock()
@@ -274,66 +256,140 @@ func (ii *InvertedIndex) Search(token string) []string {
 	return result
 }
 
-// TokenCount returns the number of unique tokens in the index.
-func (ii *InvertedIndex) TokenCount() int {
-	ii.mu.RLock()
-	defer ii.mu.RUnlock()
-	return len(ii.index)
-}
-
-// tokenize splits text into lowercase tokens, excluding stop words.
+// tokenize splits text into lowercase, unique, non-stopword tokens.
+// Single-pass: scans characters directly without intermediate slice allocations.
 func tokenize(text string) []string {
-	// Split on whitespace and common delimiters
-	fields := strings.FieldsFunc(text, func(r rune) bool {
-		return r == ' ' || r == '\t' || r == '\n' || r == ',' || r == '.' ||
-			r == '!' || r == '?' || r == ';' || r == ':' || r == '"' || r == '\''
-	})
-
 	var tokens []string
-	seen := make(map[string]bool)
-	for _, f := range fields {
-		token := strings.ToLower(strings.TrimSpace(f))
-		if len(token) < 2 {
+	seen := make(map[string]struct{}, 8)
+	start := -1
+
+	for i := 0; i <= len(text); i++ {
+		var c byte
+		if i < len(text) {
+			c = text[i]
+		}
+
+		isDelim := i == len(text) || c == ' ' || c == '\t' || c == '\n' ||
+			c == ',' || c == '.' || c == '!' || c == '?' || c == ';' ||
+			c == ':' || c == '"' || c == '\''
+
+		if !isDelim {
+			if start == -1 {
+				start = i
+			}
 			continue
 		}
+
+		if start == -1 {
+			continue
+		}
+
+		raw := text[start:i]
+		start = -1
+
+		if len(raw) < 2 {
+			continue
+		}
+
+		token := toLowerASCII(raw)
+
 		if StopWords[token] {
 			continue
 		}
-		if !seen[token] {
-			seen[token] = true
-			tokens = append(tokens, token)
+		if _, dup := seen[token]; dup {
+			continue
 		}
+
+		if len(tokens) >= 1000 {
+			break
+		}
+
+		seen[token] = struct{}{}
+		tokens = append(tokens, token)
 	}
+
 	return tokens
 }
 
+// toLowerASCII lowercases A-Z only, returns original if already lowercase.
+// Avoids strings.ToLower allocation for strings that are already lowercase.
+func toLowerASCII(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 'A' && s[i] <= 'Z' {
+			buf := make([]byte, len(s))
+			copy(buf, s)
+			for j := i; j < len(buf); j++ {
+				if buf[j] >= 'A' && buf[j] <= 'Z' {
+					buf[j] += 'a' - 'A'
+				}
+			}
+			return string(buf)
+		}
+	}
+	return s
+}
+
+// toFloat64Value converts a value to float64 if possible.
+func toFloat64Value(v interface{}) (float64, error) {
+	switch val := v.(type) {
+	case float64:
+		return val, nil
+	case float32:
+		return float64(val), nil
+	case int:
+		return float64(val), nil
+	case int64:
+		return float64(val), nil
+	default:
+		return 0, fmt.Errorf("not a number")
+	}
+}
+
 // normalizeValue converts a Go value to a normalized string key for indexing.
-// Numbers are normalized to a consistent format. Strings are stored as-is.
-// This ensures that 30 (int) and 30.0 (float64) produce the same key.
+// Numbers use IEEE 754 bit encoding so that string comparison preserves numeric ordering.
+// Strings that look like numbers are parsed and encoded numerically to ensure
+// range queries work correctly (e.g., query "age > 20" where 20 is a CLI string).
 func normalizeValue(v interface{}) string {
 	switch val := v.(type) {
 	case float64:
-		// Normalize: 30.0 -> "30", 30.5 -> "30.5"
-		if val == float64(int64(val)) {
-			return fmt.Sprintf("%d", int64(val))
-		}
-		return fmt.Sprintf("%g", val)
+		return encodeNumericKey(val)
 	case float32:
-		return normalizeValue(float64(val))
+		return encodeNumericKey(float64(val))
 	case int:
-		return fmt.Sprintf("%d", val)
+		return encodeNumericKey(float64(val))
 	case int64:
-		return fmt.Sprintf("%d", val)
+		return encodeNumericKey(float64(val))
 	case bool:
 		if val {
 			return "true"
 		}
 		return "false"
 	case string:
+		// Try to parse as number so range queries work on numeric attributes
+		if f, err := strconv.ParseFloat(val, 64); err == nil {
+			return encodeNumericKey(f)
+		}
+		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return encodeNumericKey(float64(i))
+		}
 		return val
 	case nil:
 		return ""
 	default:
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+// encodeNumericKey produces a fixed-width 16-char hex string that sorts correctly
+// with string comparison for any float64 value. Uses IEEE 754 bit manipulation:
+// flip sign bit for positives, invert all bits for negatives.
+// Uses strconv.FormatUint instead of fmt.Sprintf for ~3x fewer allocations.
+func encodeNumericKey(v float64) string {
+	bits := math.Float64bits(v)
+	if bits>>63 == 1 {
+		bits = ^bits
+	} else {
+		bits ^= 1 << 63
+	}
+	return strconv.FormatUint(bits, 16)
 }

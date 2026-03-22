@@ -5,19 +5,18 @@ import (
 	"os"
 	"sync"
 
-	"github.com/user/atomdb/internal/atom"
-	"github.com/user/atomdb/internal/disk"
-	"github.com/user/atomdb/internal/index"
+	"github.com/tita-n/atomdb/internal/atom"
+	"github.com/tita-n/atomdb/internal/disk"
+	"github.com/tita-n/atomdb/internal/index"
 )
 
 const maxHistorySize = 10000
 const syncThreshold = 1000
 
-// AtomStore is the core storage engine with B-Tree secondary indexes.
 type AtomStore struct {
 	mu                   sync.RWMutex
-	atoms                map[string]map[string]*atom.Atom // entity -> attribute -> latest atom
-	idx                  *index.IndexManager              // B-Tree + full-text indexes
+	atoms                map[string]map[string]*atom.Atom
+	idx                  *index.IndexManager
 	history              []atom.Atom
 	file                 *os.File
 	dirty                bool
@@ -58,9 +57,10 @@ func NewWithMode(path string, mode SyncMode) (*AtomStore, error) {
 		syncMode: mode,
 	}
 
-	// Replay atoms to rebuild in-memory index
+	// Replay atoms to rebuild in-memory index and populate history
 	for i := range existing {
 		store.applyAtom(&existing[i])
+		store.appendHistory(existing[i])
 	}
 
 	// Build B-Tree indexes from loaded data
@@ -69,7 +69,6 @@ func NewWithMode(path string, mode SyncMode) (*AtomStore, error) {
 	return store, nil
 }
 
-// applyAtom applies an atom to the in-memory index.
 func (s *AtomStore) applyAtom(a *atom.Atom) {
 	if _, ok := s.atoms[a.Entity]; !ok {
 		s.atoms[a.Entity] = make(map[string]*atom.Atom)
@@ -77,7 +76,6 @@ func (s *AtomStore) applyAtom(a *atom.Atom) {
 	s.atoms[a.Entity][a.Attribute] = a
 }
 
-// Set stores an atom and updates all indexes.
 func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -107,7 +105,6 @@ func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType s
 	return s.maybeSync()
 }
 
-// Get retrieves the latest atom for an entity+attribute pair.
 func (s *AtomStore) Get(entity, attribute string) (*atom.Atom, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -124,7 +121,6 @@ func (s *AtomStore) Get(entity, attribute string) (*atom.Atom, bool) {
 	return &c, true
 }
 
-// Exists checks if a live atom exists for the given entity+attribute.
 func (s *AtomStore) Exists(entity, attribute string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -137,7 +133,6 @@ func (s *AtomStore) Exists(entity, attribute string) bool {
 	return ok && a.Type != "deleted"
 }
 
-// GetAll returns all live atoms for a given entity.
 func (s *AtomStore) GetAll(entity string) map[string]*atom.Atom {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -156,8 +151,7 @@ func (s *AtomStore) GetAll(entity string) map[string]*atom.Atom {
 	return result
 }
 
-// Query performs a filtered query. Uses the attribute index to narrow candidates.
-// If attribute is empty, falls back to full scan.
+// Query performs a filtered query scanning all atoms matching the attribute.
 func (s *AtomStore) Query(attribute string, predicate func(*atom.Atom) bool) []*atom.Atom {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -165,10 +159,6 @@ func (s *AtomStore) Query(attribute string, predicate func(*atom.Atom) bool) []*
 	var results []*atom.Atom
 
 	if attribute != "" {
-		if candidates, ok := s.atoms[""]; ok {
-			_ = candidates
-		}
-		// Use byAttr index via idx manager for attribute-narrowed scan
 		for _, attrs := range s.atoms {
 			if a, ok := attrs[attribute]; ok && a.Type != "deleted" && predicate(a) {
 				c := *a
@@ -178,7 +168,6 @@ func (s *AtomStore) Query(attribute string, predicate func(*atom.Atom) bool) []*
 		return results
 	}
 
-	// Full scan
 	for _, attrs := range s.atoms {
 		for _, a := range attrs {
 			if a.Type != "deleted" && predicate(a) {
@@ -190,8 +179,6 @@ func (s *AtomStore) Query(attribute string, predicate func(*atom.Atom) bool) []*
 	return results
 }
 
-// QueryIndexed performs an exact match query using the B-Tree index.
-// Returns nil if no index exists (caller should fall back to scan).
 func (s *AtomStore) QueryIndexed(attribute, value string) []*atom.Atom {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -204,7 +191,6 @@ func (s *AtomStore) QueryIndexed(attribute, value string) []*atom.Atom {
 	return s.resolveKeys(keys)
 }
 
-// QueryRange performs a range query using the B-Tree index.
 func (s *AtomStore) QueryRange(attribute string, op index.RangeOp, value string) []*atom.Atom {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -217,7 +203,6 @@ func (s *AtomStore) QueryRange(attribute string, op index.RangeOp, value string)
 	return s.resolveKeys(keys)
 }
 
-// QueryExplain returns info about how a query would be executed.
 func (s *AtomStore) QueryExplain(attribute, op, value string) QueryPlan {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -260,7 +245,6 @@ func (s *AtomStore) QueryExplain(attribute, op, value string) QueryPlan {
 	return plan
 }
 
-// FullTextSearch searches for entities with a word in a text attribute.
 func (s *AtomStore) FullTextSearch(attribute, word string) []*atom.Atom {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -269,7 +253,6 @@ func (s *AtomStore) FullTextSearch(attribute, word string) []*atom.Atom {
 	return s.resolveKeys(keys)
 }
 
-// resolveKeys converts "entity.attribute" keys to actual Atom copies.
 func (s *AtomStore) resolveKeys(keys []string) []*atom.Atom {
 	var results []*atom.Atom
 	seen := make(map[string]bool)
@@ -292,12 +275,10 @@ func (s *AtomStore) resolveKeys(keys []string) []*atom.Atom {
 	return results
 }
 
-// Delete marks an atom as deleted. Returns error if atom doesn't exist.
 func (s *AtomStore) Delete(entity, attribute string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check existence
 	attrs, ok := s.atoms[entity]
 	if !ok {
 		return ErrNotFound
@@ -307,7 +288,6 @@ func (s *AtomStore) Delete(entity, attribute string) error {
 		return ErrNotFound
 	}
 
-	// Remove old atom from index
 	s.idx.RemoveAtom(existing)
 
 	tombstone, err := atom.NewAtom(entity, attribute, nil, "deleted")
@@ -327,12 +307,14 @@ func (s *AtomStore) Delete(entity, attribute string) error {
 	return s.maybeSync()
 }
 
-// ErrNotFound is returned when a delete target doesn't exist.
 var ErrNotFound = fmt.Errorf("not found")
 
-// Compact rewrites the data file.
+// Compact rewrites the data file. Holds full Lock for the entire operation
+// to prevent concurrent writes to the closed file handle.
 func (s *AtomStore) Compact() error {
-	s.mu.RLock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	path := s.file.Name()
 	atomsSnapshot := make(map[string]map[string]*atom.Atom, len(s.atoms))
 	for entity, attrs := range s.atoms {
@@ -342,19 +324,19 @@ func (s *AtomStore) Compact() error {
 		}
 		atomsSnapshot[entity] = attrsCopy
 	}
+
+	// Close file while we hold the exclusive lock
 	s.file.Close()
-	s.mu.RUnlock()
 
 	compactErr := disk.Compact(path, atomsSnapshot, true)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if compactErr != nil {
-		file, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
-		if file != nil {
-			s.file = file
+		// Try to reopen even on failure
+		file, reopenErr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if reopenErr != nil {
+			return fmt.Errorf("compaction failed and could not reopen: %v (reopen: %v)", compactErr, reopenErr)
 		}
+		s.file = file
 		return fmt.Errorf("compaction failed: %w", compactErr)
 	}
 
@@ -370,12 +352,11 @@ func (s *AtomStore) Compact() error {
 
 // RebuildIndexes forces a full rebuild of all B-Tree indexes.
 func (s *AtomStore) RebuildIndexes() {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.idx.RebuildFromAtoms(s.atoms)
 }
 
-// Close flushes and closes.
 func (s *AtomStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -389,7 +370,6 @@ func (s *AtomStore) Close() error {
 	return nil
 }
 
-// Stats returns store statistics.
 type StoreStats struct {
 	EntityCount    int
 	AtomCount      int
@@ -413,14 +393,13 @@ func (s *AtomStore) Stats() StoreStats {
 	}
 }
 
-// QueryPlan describes how a query will be executed.
 type QueryPlan struct {
 	Attribute     string
 	Operator      string
 	Value         string
 	UseIndex      bool
-	IndexType     string // "btree" or ""
-	ScanType      string // "exact", "range", "full"
+	IndexType     string
+	ScanType      string
 	EstimatedRows int
 }
 
@@ -474,7 +453,6 @@ func (s *AtomStore) maxAtomVersion() int64 {
 	return max
 }
 
-// splitEntityAttr splits "entity.attribute" into [entity, attribute].
 func splitEntityAttr(key string) []string {
 	for i := len(key) - 1; i >= 0; i-- {
 		if key[i] == '.' {

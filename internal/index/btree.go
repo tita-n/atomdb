@@ -1,68 +1,56 @@
-// Package btree implements a B-Tree for sorted key-value storage.
-// Design decision: Order 32 means each node holds 15-31 keys (min 15 before merge,
-// max 31 before split). Order 32 was chosen because it matches a typical OS page
-// size (4KB) when keys average ~100 bytes, giving good cache locality.
-//
-// The B-Tree stores string keys mapped to string slices (entity references).
-// This is used as a secondary index: key = normalized value, value = []entity.attr
-// that have that value for a given attribute.
 package index
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
 )
 
-// Order is the maximum number of children per node.
-// A node splits when it reaches Order keys.
 const Order = 32
-
-// maxKeys is the maximum keys before split (Order - 1).
 const maxKeys = Order - 1
-
-// minKeys is the minimum keys after merge (ceil(Order/2) - 1).
 const minKeys = Order/2 - 1
 
-// BTreeNode represents a single node in the B-Tree.
+// MaxBTreeKeys limits unique keys per B-Tree to prevent memory exhaustion.
+const MaxBTreeKeys = 100000
+
 type BTreeNode struct {
-	keys     []string     // sorted keys
-	values   [][]string   // entity references per key
-	children []*BTreeNode // child pointers (nil for leaf)
+	keys     []string
+	values   [][]string
+	valSets  []map[string]struct{} // parallel dedup set: valSets[i] tracks entities in values[i]
+	children []*BTreeNode
 	leaf     bool
 }
 
-// BTree is a concurrent-safe B-Tree index.
 type BTree struct {
 	root  *BTreeNode
 	mu    sync.RWMutex
-	count int // total number of entries (key-value pairs)
+	count int
 }
 
-// New creates an empty B-Tree.
 func New() *BTree {
 	return &BTree{
 		root: &BTreeNode{leaf: true},
 	}
 }
 
-// Insert adds or updates an entry. If the key exists, entities are appended.
-// Duplicate entities are not added twice.
-func (t *BTree) Insert(key string, entities []string) {
+func (t *BTree) Insert(key string, entities []string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	t.insert(key, entities)
+	return t.insert(key, entities)
 }
 
-func (t *BTree) insert(key string, entities []string) {
-	// Use recursive insert - returns true if key already existed
-	existed := t.insertNode(t.root, key, entities)
+func (t *BTree) insert(key string, entities []string) error {
+	existed := t.keyExists(t.root, key)
+	if !existed && t.count >= MaxBTreeKeys {
+		return fmt.Errorf("B-Tree key limit (%d) exceeded", MaxBTreeKeys)
+	}
+
+	t.insertNode(t.root, key, entities)
 	if !existed {
 		t.count++
 	}
 
-	// If root was split, create new root
 	if len(t.root.keys) > maxKeys {
 		old := t.root
 		t.root = &BTreeNode{
@@ -70,48 +58,67 @@ func (t *BTree) insert(key string, entities []string) {
 		}
 		t.splitChild(t.root, 0)
 	}
+	return nil
 }
 
-// insertNode recursively inserts into the given node.
-// Returns true if the key already existed (updated), false if new key was added.
+func (t *BTree) keyExists(n *BTreeNode, key string) bool {
+	i := sort.Search(len(n.keys), func(i int) bool {
+		return n.keys[i] >= key
+	})
+	if i < len(n.keys) && n.keys[i] == key {
+		return true
+	}
+	if n.leaf {
+		return false
+	}
+	return t.keyExists(n.children[i], key)
+}
+
 func (t *BTree) insertNode(n *BTreeNode, key string, entities []string) bool {
 	if n.leaf {
-		// Find insertion point
 		i := sort.Search(len(n.keys), func(i int) bool {
 			return n.keys[i] >= key
 		})
 
 		if i < len(n.keys) && n.keys[i] == key {
-			// Key exists - append entities with dedup
-			n.values[i] = dedup(append(n.values[i], entities...))
+			// O(1) dedup per entity using valSets instead of O(n) dedup()
+			for _, e := range entities {
+				if _, exists := n.valSets[i][e]; !exists {
+					n.valSets[i][e] = struct{}{}
+					n.values[i] = append(n.values[i], e)
+				}
+			}
 			return true
 		}
 
 		// Insert new key at position i
 		n.keys = append(n.keys, "")
 		n.values = append(n.values, nil)
+		n.valSets = append(n.valSets, nil)
 		copy(n.keys[i+1:], n.keys[i:])
 		copy(n.values[i+1:], n.values[i:])
+		copy(n.valSets[i+1:], n.valSets[i:])
 		n.keys[i] = key
 		n.values[i] = entities
+		set := make(map[string]struct{}, len(entities))
+		for _, e := range entities {
+			set[e] = struct{}{}
+		}
+		n.valSets[i] = set
 		return false
 	}
 
-	// Internal node - find child to descend into
 	i := sort.Search(len(n.keys), func(i int) bool {
 		return n.keys[i] >= key
 	})
 
-	// If key equals keys[i], we still go to children[i+1] for insertion
-	// Actually for internal nodes, if key matches, the actual data is in the
-	// leaf below. But our design stores entity refs in both leaves and internal
-	// nodes when splitting. Let me keep it simple: exact match in internal node
-	// means update in place.
 	if i < len(n.keys) && n.keys[i] == key {
-		n.values[i] = dedup(append(n.values[i], entities...))
-		// Also propagate to leaf? No - let's only store in leaves.
-		// Actually, for simplicity, let me store in internal nodes too when
-		// they happen to have the key. The search checks all nodes.
+		for _, e := range entities {
+			if _, exists := n.valSets[i][e]; !exists {
+				n.valSets[i][e] = struct{}{}
+				n.values[i] = append(n.values[i], e)
+			}
+		}
 		return true
 	}
 
@@ -119,10 +126,8 @@ func (t *BTree) insertNode(n *BTreeNode, key string, entities []string) bool {
 		i = len(n.keys)
 	}
 
-	// Descend to child
 	existed := t.insertNode(n.children[i], key, entities)
 
-	// Check if child needs splitting
 	if len(n.children[i].keys) > maxKeys {
 		t.splitChild(n, i)
 	}
@@ -130,58 +135,55 @@ func (t *BTree) insertNode(n *BTreeNode, key string, entities []string) bool {
 	return existed
 }
 
-// splitChild splits child c[i] into two, promoting median key to parent n.
 func (t *BTree) splitChild(n *BTreeNode, i int) {
 	child := n.children[i]
 	median := len(child.keys) / 2
 
-	// Create new right node
 	right := &BTreeNode{
 		leaf: child.leaf,
 	}
 
-	// Right gets keys/values after median
 	right.keys = make([]string, len(child.keys)-median-1)
 	right.values = make([][]string, len(child.keys)-median-1)
+	right.valSets = make([]map[string]struct{}, len(child.keys)-median-1)
 	copy(right.keys, child.keys[median+1:])
 	copy(right.values, child.values[median+1:])
+	copy(right.valSets, child.valSets[median+1:])
 
-	// Right gets children after median (if not leaf)
 	if !child.leaf {
 		right.children = make([]*BTreeNode, len(child.children)-median-1)
 		copy(right.children, child.children[median+1:])
 	}
 
-	// Median key promoted to parent
 	medianKey := child.keys[median]
 	medianValue := child.values[median]
+	medianSet := child.valSets[median]
 
-	// Truncate left child to keys before median
 	child.keys = child.keys[:median]
 	child.values = child.values[:median]
+	child.valSets = child.valSets[:median]
 	if !child.leaf {
 		child.children = child.children[:median+1]
 	}
 
-	// Insert median into parent
 	n.keys = append(n.keys, "")
 	n.values = append(n.values, nil)
+	n.valSets = append(n.valSets, nil)
 	copy(n.keys[i+1:], n.keys[i:])
 	copy(n.values[i+1:], n.values[i:])
+	copy(n.valSets[i+1:], n.valSets[i:])
 	n.keys[i] = medianKey
 	n.values[i] = medianValue
+	n.valSets[i] = medianSet
 
-	// Insert right child into parent
 	n.children = append(n.children, nil)
 	copy(n.children[i+2:], n.children[i+1:])
 	n.children[i+1] = right
 }
 
-// Search finds exact matches for a key.
 func (t *BTree) Search(key string) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-
 	return t.search(t.root, key)
 }
 
@@ -201,29 +203,15 @@ func (t *BTree) search(n *BTreeNode, key string) []string {
 	return t.search(n.children[i], key)
 }
 
-// searchNode is a non-recursive helper that returns the node and index.
-// Used only for root-level checks.
-func (t *BTree) searchNode(n *BTreeNode, key string) (int, bool) {
-	i := sort.Search(len(n.keys), func(i int) bool {
-		return n.keys[i] >= key
-	})
-	if i < len(n.keys) && n.keys[i] == key {
-		return i, true
-	}
-	return i, false
-}
-
-// RangeOp defines range query operators.
 type RangeOp int
 
 const (
-	OpGt  RangeOp = iota // >
-	OpGte                // >=
-	OpLt                 // <
-	OpLte                // <=
+	OpGt RangeOp = iota
+	OpGte
+	OpLt
+	OpLte
 )
 
-// RangeQuery returns all entity references where key op value.
 func (t *BTree) RangeQuery(op RangeOp, value string) []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -241,13 +229,15 @@ func (t *BTree) RangeQuery(op RangeOp, value string) []string {
 	return nil
 }
 
-// rangeGT collects all entries with key > value (or >= if inclusive).
 func (t *BTree) rangeGT(value string, inclusive bool) []string {
-	var result []string
+	result := make([]string, 0, t.count/4)
 	t.collectGT(t.root, value, inclusive, &result)
 	return result
 }
 
+// collectGT gathers all entries with key > value (or >= if inclusive).
+// On internal nodes, recurse into children[i] with the same filter
+// instead of calling collectAll — children[i] may contain keys <= value.
 func (t *BTree) collectGT(n *BTreeNode, value string, inclusive bool, result *[]string) {
 	i := sort.Search(len(n.keys), func(i int) bool {
 		if inclusive {
@@ -263,12 +253,12 @@ func (t *BTree) collectGT(n *BTreeNode, value string, inclusive bool, result *[]
 		return
 	}
 
-	// Collect from left subtree first (all keys in children[i] are < keys[i])
+	// Recurse into children[i] — it may contain keys both above and below value
 	if i < len(n.children) {
-		t.collectAll(n.children[i], result)
+		t.collectGT(n.children[i], value, inclusive, result)
 	}
 
-	// Then the separator key and everything to the right
+	// Then separator keys[i..] and their right subtrees
 	for ; i < len(n.keys); i++ {
 		*result = append(*result, n.values[i]...)
 		if i+1 < len(n.children) {
@@ -277,13 +267,14 @@ func (t *BTree) collectGT(n *BTreeNode, value string, inclusive bool, result *[]
 	}
 }
 
-// rangeLT collects all entries with key < value (or <= if inclusive).
 func (t *BTree) rangeLT(value string, inclusive bool) []string {
-	var result []string
+	result := make([]string, 0, t.count/4)
 	t.collectLT(t.root, value, inclusive, &result)
 	return result
 }
 
+// collectLT gathers all entries with key < value (or <= if inclusive).
+// Recurse into children[i] instead of collectAll on children[j].
 func (t *BTree) collectLT(n *BTreeNode, value string, inclusive bool, result *[]string) {
 	i := sort.Search(len(n.keys), func(i int) bool {
 		if inclusive {
@@ -299,21 +290,20 @@ func (t *BTree) collectLT(n *BTreeNode, value string, inclusive bool, result *[]
 		return
 	}
 
-	// Keys before i and their left subtrees
+	// Recurse into children before i — they may contain keys both above and below value
 	for j := 0; j < i && j < len(n.keys); j++ {
 		if j < len(n.children) {
-			t.collectAll(n.children[j], result)
+			t.collectLT(n.children[j], value, inclusive, result)
 		}
 		*result = append(*result, n.values[j]...)
 	}
 
-	// Descend into children[i] if it exists
+	// Recurse into children[i] — may contain keys both above and below value
 	if i < len(n.children) {
 		t.collectLT(n.children[i], value, inclusive, result)
 	}
 }
 
-// collectAll gathers every entry in the subtree.
 func (t *BTree) collectAll(n *BTreeNode, result *[]string) {
 	if n == nil {
 		return
@@ -333,14 +323,12 @@ func (t *BTree) collectAll(n *BTreeNode, result *[]string) {
 	}
 }
 
-// Count returns the total number of unique keys in the tree.
 func (t *BTree) Count() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.count
 }
 
-// Keys returns all keys in sorted order (for debugging/stats).
 func (t *BTree) Keys() []string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -363,13 +351,15 @@ func (t *BTree) collectKeys(n *BTreeNode, keys *[]string) {
 	}
 }
 
-// Remove deletes an entity reference from a key.
-// If no entities remain, the key is removed entirely.
 func (t *BTree) Remove(key string, entity string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
 	t.remove(t.root, key, entity)
+
+	// Shrink tree if root is now empty internal node
+	if !t.root.leaf && len(t.root.keys) == 0 {
+		t.root = t.root.children[0]
+	}
 }
 
 func (t *BTree) remove(n *BTreeNode, key string, entity string) {
@@ -377,44 +367,192 @@ func (t *BTree) remove(n *BTreeNode, key string, entity string) {
 		return n.keys[i] >= key
 	})
 
-	if i < len(n.keys) && n.keys[i] == key {
-		// Found - remove entity from the list
+	found := i < len(n.keys) && n.keys[i] == key
+
+	if found {
+		// Remove from dedup set
+		if n.valSets[i] != nil {
+			delete(n.valSets[i], entity)
+		}
 		n.values[i] = removeStr(n.values[i], entity)
 		if len(n.values[i]) == 0 {
-			// No more entities - remove key
+			t.count--
 			if n.leaf {
 				n.keys = append(n.keys[:i], n.keys[i+1:]...)
 				n.values = append(n.values[:i], n.values[i+1:]...)
-				t.count--
+				n.valSets = append(n.valSets[:i], n.valSets[i+1:]...)
 			} else {
-				// For internal nodes, just clear it (simplified)
-				n.keys = append(n.keys[:i], n.keys[i+1:]...)
-				n.values = append(n.values[:i], n.values[i+1:]...)
-				t.count--
+				// Replace with successor from right subtree
+				succ := t.findMin(n.children[i+1])
+				n.keys[i] = succ.keys[0]
+				n.values[i] = succ.values[0]
+				n.valSets[i] = succ.valSets[0]
+				t.remove(n.children[i+1], succ.keys[0], succ.values[0][0])
+				t.rebalance(n, i+1)
 			}
 		}
 		return
 	}
 
-	if !n.leaf && i < len(n.children) {
-		t.remove(n.children[i], key, entity)
+	if n.leaf {
+		return
 	}
+
+	if i >= len(n.children) {
+		return
+	}
+
+	t.remove(n.children[i], key, entity)
+	t.rebalance(n, i)
 }
 
-// Helper: dedup a string slice.
-func dedup(s []string) []string {
-	seen := make(map[string]bool, len(s))
-	result := make([]string, 0, len(s))
-	for _, v := range s {
-		if !seen[v] {
-			seen[v] = true
-			result = append(result, v)
+// rebalance ensures n.children[childIdx] has at least minKeys+1 keys.
+// Called after a deletion that may have caused underflow in the child.
+func (t *BTree) rebalance(parent *BTreeNode, childIdx int) {
+	child := parent.children[childIdx]
+	if len(child.keys) >= minKeys+1 {
+		return // Child is fine
+	}
+
+	// Try to borrow from left sibling
+	if childIdx > 0 {
+		left := parent.children[childIdx-1]
+		if len(left.keys) > minKeys+1 {
+			t.borrowFromLeft(parent, childIdx)
+			return
 		}
 	}
-	return result
+
+	// Try to borrow from right sibling
+	if childIdx < len(parent.children)-1 {
+		right := parent.children[childIdx+1]
+		if len(right.keys) > minKeys+1 {
+			t.borrowFromRight(parent, childIdx)
+			return
+		}
+	}
+
+	// Must merge - pick a direction
+	if childIdx > 0 {
+		t.mergeWithLeft(parent, childIdx)
+	} else {
+		t.mergeWithRight(parent, childIdx)
+	}
 }
 
-// Helper: remove first occurrence of a string from slice.
+// borrowFromLeft takes the largest key from left sibling through parent.
+func (t *BTree) borrowFromLeft(parent *BTreeNode, childIdx int) {
+	left := parent.children[childIdx-1]
+	child := parent.children[childIdx]
+
+	// Rotate parent separator down into child
+	child.keys = append([]string{parent.keys[childIdx-1]}, child.keys...)
+	child.values = append([][]string{parent.values[childIdx-1]}, child.values...)
+	child.valSets = append([]map[string]struct{}{parent.valSets[childIdx-1]}, child.valSets...)
+
+	// Move left sibling's last child to child's first position
+	if !left.leaf {
+		lastChild := left.children[len(left.children)-1]
+		left.children = left.children[:len(left.children)-1]
+		child.children = append([]*BTreeNode{lastChild}, child.children...)
+	}
+
+	// Move left sibling's last key up to parent
+	parent.keys[childIdx-1] = left.keys[len(left.keys)-1]
+	parent.values[childIdx-1] = left.values[len(left.values)-1]
+	parent.valSets[childIdx-1] = left.valSets[len(left.valSets)-1]
+	left.keys = left.keys[:len(left.keys)-1]
+	left.values = left.values[:len(left.values)-1]
+	left.valSets = left.valSets[:len(left.valSets)-1]
+}
+
+// borrowFromRight takes the smallest key from right sibling through parent.
+func (t *BTree) borrowFromRight(parent *BTreeNode, childIdx int) {
+	right := parent.children[childIdx+1]
+	child := parent.children[childIdx]
+
+	// Rotate parent separator down into child
+	child.keys = append(child.keys, parent.keys[childIdx])
+	child.values = append(child.values, parent.values[childIdx])
+	child.valSets = append(child.valSets, parent.valSets[childIdx])
+
+	// Move right sibling's first child to child's last position
+	if !right.leaf {
+		firstChild := right.children[0]
+		right.children = right.children[1:]
+		child.children = append(child.children, firstChild)
+	}
+
+	// Move right sibling's first key up to parent
+	parent.keys[childIdx] = right.keys[0]
+	parent.values[childIdx] = right.values[0]
+	parent.valSets[childIdx] = right.valSets[0]
+	right.keys = right.keys[1:]
+	right.values = right.values[1:]
+	right.valSets = right.valSets[1:]
+}
+
+// mergeWithLeft merges child into left sibling with parent separator.
+func (t *BTree) mergeWithLeft(parent *BTreeNode, childIdx int) {
+	left := parent.children[childIdx-1]
+	child := parent.children[childIdx]
+
+	// Pull parent separator into left
+	left.keys = append(left.keys, parent.keys[childIdx-1])
+	left.values = append(left.values, parent.values[childIdx-1])
+	left.valSets = append(left.valSets, parent.valSets[childIdx-1])
+
+	// Append child's keys/values/valSets
+	left.keys = append(left.keys, child.keys...)
+	left.values = append(left.values, child.values...)
+	left.valSets = append(left.valSets, child.valSets...)
+
+	// Append child's children
+	if !child.leaf {
+		left.children = append(left.children, child.children...)
+	}
+
+	// Remove separator from parent
+	parent.keys = append(parent.keys[:childIdx-1], parent.keys[childIdx:]...)
+	parent.values = append(parent.values[:childIdx-1], parent.values[childIdx:]...)
+	parent.valSets = append(parent.valSets[:childIdx-1], parent.valSets[childIdx:]...)
+	parent.children = append(parent.children[:childIdx], parent.children[childIdx+1:]...)
+}
+
+// mergeWithRight merges child into itself with right sibling and parent separator.
+func (t *BTree) mergeWithRight(parent *BTreeNode, childIdx int) {
+	child := parent.children[childIdx]
+	right := parent.children[childIdx+1]
+
+	// Pull parent separator into child
+	child.keys = append(child.keys, parent.keys[childIdx])
+	child.values = append(child.values, parent.values[childIdx])
+	child.valSets = append(child.valSets, parent.valSets[childIdx])
+
+	// Append right's keys/values/valSets
+	child.keys = append(child.keys, right.keys...)
+	child.values = append(child.values, right.values...)
+	child.valSets = append(child.valSets, right.valSets...)
+
+	// Append right's children
+	if !right.leaf {
+		child.children = append(child.children, right.children...)
+	}
+
+	// Remove separator from parent
+	parent.keys = append(parent.keys[:childIdx], parent.keys[childIdx+1:]...)
+	parent.values = append(parent.values[:childIdx], parent.values[childIdx+1:]...)
+	parent.valSets = append(parent.valSets[:childIdx], parent.valSets[childIdx+1:]...)
+	parent.children = append(parent.children[:childIdx+1], parent.children[childIdx+2:]...)
+}
+
+func (t *BTree) findMin(n *BTreeNode) *BTreeNode {
+	for !n.leaf {
+		n = n.children[0]
+	}
+	return n
+}
+
 func removeStr(s []string, target string) []string {
 	for i, v := range s {
 		if v == target {
@@ -424,7 +562,6 @@ func removeStr(s []string, target string) []string {
 	return s
 }
 
-// Debug returns a text representation of the tree structure.
 func (t *BTree) Debug() string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
