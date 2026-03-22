@@ -112,6 +112,7 @@ func (im *IndexManager) RebuildFromAtoms(atoms map[string]map[string]*atom.Atom)
 	im.mu.Lock()
 	im.indexes = make(map[string]*BTree)
 	im.textIdx = make(map[string]*InvertedIndex)
+	im.attrTypes = make(map[string]string)
 	im.mu.Unlock()
 
 	for _, attrs := range atoms {
@@ -340,6 +341,8 @@ func toFloat64Value(v interface{}) (float64, error) {
 		return float64(val), nil
 	case int64:
 		return float64(val), nil
+	case string:
+		return strconv.ParseFloat(val, 64)
 	default:
 		return 0, fmt.Errorf("not a number")
 	}
@@ -391,5 +394,9 @@ func encodeNumericKey(v float64) string {
 	} else {
 		bits ^= 1 << 63
 	}
-	return strconv.FormatUint(bits, 16)
+	hex := strconv.FormatUint(bits, 16)
+	if len(hex) < 16 {
+		return "0000000000000000"[:16-len(hex)] + hex
+	}
+	return hex
 }

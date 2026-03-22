@@ -13,6 +13,26 @@ import (
 const maxHistorySize = 10000
 const syncThreshold = 1000
 
+const (
+	DefaultMaxEntities = 100000
+	DefaultMaxAtoms    = 1000000
+	DefaultMaxAttrs    = 1000
+)
+
+type StoreLimits struct {
+	MaxEntities int
+	MaxAtoms    int
+	MaxAttrs    int
+}
+
+func DefaultLimits() StoreLimits {
+	return StoreLimits{
+		MaxEntities: DefaultMaxEntities,
+		MaxAtoms:    DefaultMaxAtoms,
+		MaxAttrs:    DefaultMaxAttrs,
+	}
+}
+
 type AtomStore struct {
 	mu                   sync.RWMutex
 	atoms                map[string]map[string]*atom.Atom
@@ -23,6 +43,7 @@ type AtomStore struct {
 	dirtyCount           int
 	lastPersistedVersion int64
 	syncMode             SyncMode
+	limits               StoreLimits
 }
 
 type SyncMode int
@@ -37,6 +58,10 @@ func New(path string) (*AtomStore, error) {
 }
 
 func NewWithMode(path string, mode SyncMode) (*AtomStore, error) {
+	return NewWithModeAndLimits(path, mode, DefaultLimits())
+}
+
+func NewWithModeAndLimits(path string, mode SyncMode, limits StoreLimits) (*AtomStore, error) {
 	disk.CleanupOrphaned(path)
 
 	existing, err := disk.Load(path)
@@ -55,6 +80,7 @@ func NewWithMode(path string, mode SyncMode) (*AtomStore, error) {
 		history:  make([]atom.Atom, 0),
 		file:     file,
 		syncMode: mode,
+		limits:   limits,
 	}
 
 	// Replay atoms to rebuild in-memory index and populate history
@@ -79,6 +105,33 @@ func (s *AtomStore) applyAtom(a *atom.Atom) {
 func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Check entity limit
+	if _, exists := s.atoms[entity]; !exists {
+		if len(s.atoms) >= s.limits.MaxEntities {
+			return fmt.Errorf("maximum entity count (%d) exceeded", s.limits.MaxEntities)
+		}
+	}
+
+	// Check attribute limit
+	if attrs, exists := s.atoms[entity]; exists {
+		if _, attrExists := attrs[attribute]; !attrExists {
+			if len(attrs) >= s.limits.MaxAttrs {
+				return fmt.Errorf("maximum attributes per entity (%d) exceeded for entity %q", s.limits.MaxAttrs, entity)
+			}
+		}
+	}
+
+	// Check total atom limit (only for new atoms, not updates)
+	isNewAtom := true
+	if attrs, ok := s.atoms[entity]; ok {
+		if _, exists := attrs[attribute]; exists {
+			isNewAtom = false
+		}
+	}
+	if isNewAtom && s.atomCount() >= s.limits.MaxAtoms {
+		return fmt.Errorf("maximum atom count (%d) exceeded", s.limits.MaxAtoms)
+	}
 
 	a, err := atom.NewAtom(entity, attribute, value, valueType)
 	if err != nil {
@@ -253,22 +306,21 @@ func (s *AtomStore) FullTextSearch(attribute, word string) []*atom.Atom {
 	return s.resolveKeys(keys)
 }
 
+// resolveKeys converts "entity.attribute" keys to Atom pointers.
+// Pre-allocates results slice and skips dedup since B-Tree already guarantees uniqueness.
 func (s *AtomStore) resolveKeys(keys []string) []*atom.Atom {
-	var results []*atom.Atom
-	seen := make(map[string]bool)
+	if len(keys) == 0 {
+		return nil
+	}
+	results := make([]*atom.Atom, 0, len(keys))
 	for _, k := range keys {
-		if seen[k] {
-			continue
-		}
-		seen[k] = true
 		parts := splitEntityAttr(k)
 		if len(parts) != 2 {
 			continue
 		}
 		if attrs, ok := s.atoms[parts[0]]; ok {
 			if a, ok := attrs[parts[1]]; ok && a.Type != "deleted" {
-				c := *a
-				results = append(results, &c)
+				results = append(results, a)
 			}
 		}
 	}

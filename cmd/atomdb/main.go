@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/tita-n/atomdb/cli"
+	"github.com/tita-n/atomdb/internal/schema"
 	"github.com/tita-n/atomdb/internal/store"
 )
 
@@ -38,7 +39,19 @@ func run() error {
 	}
 	defer s.Close()
 
-	return cli.Run(s, os.Args[1:])
+	// Data directory for schema persistence
+	dataDir := filepath.Dir(dbPath)
+	if dataDir == "." {
+		dataDir = "data"
+		os.MkdirAll(dataDir, 0700)
+	}
+
+	sc := schema.New()
+	sc.LoadFromFile(dataDir + "/schema.json")
+
+	db := cli.NewDB(s, sc, dataDir)
+
+	return cli.Run(db, os.Args[1:])
 }
 
 func sanitizePath(p string) (string, error) {
@@ -48,16 +61,13 @@ func sanitizePath(p string) (string, error) {
 	if strings.ContainsRune(p, 0) {
 		return "", fmt.Errorf("invalid database path: contains null byte")
 	}
-
 	p = filepath.Clean(p)
-
 	if filepath.IsAbs(p) {
 		return "", fmt.Errorf("invalid database path: must not be absolute")
 	}
 	if strings.Contains(p, "..") {
 		return "", fmt.Errorf("invalid database path: must not contain '..'")
 	}
-
 	return p, nil
 }
 

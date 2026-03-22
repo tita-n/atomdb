@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -9,11 +8,31 @@ import (
 	"strings"
 
 	"github.com/tita-n/atomdb/internal/atom"
-	"github.com/tita-n/atomdb/internal/index"
+	"github.com/tita-n/atomdb/internal/query"
+	"github.com/tita-n/atomdb/internal/schema"
 	"github.com/tita-n/atomdb/internal/store"
 )
 
-func Run(s *store.AtomStore, args []string) error {
+// DB holds the store and schema for CLI operations.
+type DB struct {
+	Store   *store.AtomStore
+	Schema  *schema.Schema
+	DataDir string
+}
+
+func NewDB(s *store.AtomStore, sc *schema.Schema, dataDir string) *DB {
+	return &DB{Store: s, Schema: sc, DataDir: dataDir}
+}
+
+// persistSchema saves the schema to a JSON file in the data directory.
+func (db *DB) persistSchema() {
+	if db.DataDir == "" {
+		return
+	}
+	db.Schema.SaveToFile(db.DataDir + "/schema.json")
+}
+
+func Run(db *DB, args []string) error {
 	if len(args) == 0 {
 		printHelp()
 		return nil
@@ -22,72 +41,340 @@ func Run(s *store.AtomStore, args []string) error {
 	cmd := strings.ToLower(args[0])
 
 	switch cmd {
-	case "set":
-		return cmdSet(s, args[1:])
-	case "get":
-		return cmdGet(s, args[1:])
-	case "getall":
-		return cmdGetAll(s, args[1:])
-	case "query":
-		return cmdQuery(s, args[1:])
-	case "explain":
-		return cmdExplain(s, args[1:])
+	case "type":
+		return cmdType(db, args[1:])
+	case "insert":
+		return cmdInsert(db, args[1:])
+	case "update":
+		return cmdUpdate(db, args[1:])
 	case "delete":
-		return cmdDelete(s, args[1:])
+		return cmdDeleteCmd(db, args[1:])
+	case "types":
+		return cmdTypes(db)
+	case "set":
+		return cmdSet(db.Store, args[1:])
+	case "get":
+		return cmdGet(db.Store, args[1:])
+	case "getall":
+		return cmdGetAll(db.Store, args[1:])
+	case "query":
+		return cmdQuery(db.Store, args[1:])
+	case "explain":
+		return cmdExplain(db.Store, args[1:])
 	case "search":
-		return cmdSearch(s, args[1:])
+		return cmdSearch(db.Store, args[1:])
 	case "index":
-		return cmdIndex(s, args[1:])
+		return cmdIndex(db.Store, args[1:])
 	case "stats":
-		return cmdStats(s)
+		return cmdStats(db.Store)
 	case "compact":
-		return cmdCompact(s)
+		return cmdCompact(db.Store)
 	case "help":
 		printHelp()
 		return nil
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
-		printHelp()
-		return fmt.Errorf("unknown command: %s", cmd)
+		// Try as shorthand query: "type where condition"
+		return tryShorthandQuery(db, args)
 	}
 }
 
-func cmdSet(s *store.AtomStore, args []string) error {
-	if len(args) < 3 {
-		return fmt.Errorf("usage: set <entity> <attribute> <value> <type>")
+// cmdType handles: TYPE name { fields }
+func cmdType(db *DB, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: type name { field: type, ... }")
 	}
 
-	entity := args[0]
-	attribute := args[1]
+	// Rejoin args and handle shell splitting of braces
+	input := "TYPE " + strings.Join(args, " ")
 
-	var rawValue string
-	var valueType string
+	// Fix: shell may split "{name:" into separate args
+	// Rejoin to ensure braces are together
+	input = strings.ReplaceAll(input, "{ ", "{")
+	input = strings.ReplaceAll(input, " }", "}")
 
-	if len(args) == 3 {
-		rawValue = ""
-		valueType = args[2]
-	} else if len(args) == 4 {
-		rawValue = args[2]
-		valueType = args[3]
-	} else {
-		rawValue = strings.Join(args[2:len(args)-1], " ")
-		valueType = args[len(args)-1]
-	}
-
-	value, err := parseValue(rawValue, valueType)
+	name, fields, err := schema.ParseTypeDefinition(input)
 	if err != nil {
-		return fmt.Errorf("invalid value for type %s: %w", valueType, err)
-	}
-
-	if err := s.Set(entity, attribute, value, valueType); err != nil {
 		return err
 	}
 
-	if rawValue == "" {
-		fmt.Printf("Stored: %s.%s = \"\" (%s)\n", entity, attribute, valueType)
-	} else {
-		fmt.Printf("Stored: %s.%s = %v\n", entity, attribute, value)
+	if err := db.Schema.DefineType(name, fields); err != nil {
+		return err
 	}
+
+	// Persist schema to the data directory
+	db.persistSchema()
+
+	fmt.Printf("Type %q defined with %d fields\n", name, len(fields))
+	return nil
+}
+
+// cmdInsert handles: INSERT type field:value field:value
+func cmdInsert(db *DB, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: insert <type> field:value [field:value ...]")
+	}
+
+	typeName := args[0]
+	fields := make(map[string]interface{})
+
+	for _, arg := range args[1:] {
+		parts := strings.SplitN(arg, ":", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("expected field:value, got %q", arg)
+		}
+		fields[parts[0]] = parseRawVal(parts[1])
+	}
+
+	// Validate against schema if type is defined
+	validated, err := db.Schema.Validate(typeName, fields)
+	if err != nil {
+		return fmt.Errorf("validation failed: %w", err)
+	}
+
+	// Generate entity ID
+	entity := fmt.Sprintf("%s:%d", typeName, len(validated))
+
+	// Check if we need a better ID (use a name-like field if present)
+	for _, idField := range []string{"name", "id", "email", "title"} {
+		if v, ok := validated[idField]; ok {
+			entity = fmt.Sprintf("%s:%v", typeName, v)
+			break
+		}
+	}
+
+	// Store each field as an atom
+	for attr, val := range validated {
+		valType := inferType(val)
+		if err := db.Store.Set(entity, attr, val, valType); err != nil {
+			return fmt.Errorf("failed to store %s.%s: %w", entity, attr, err)
+		}
+	}
+
+	fmt.Printf("Inserted: %s (%d fields)\n", entity, len(validated))
+	return nil
+}
+
+// cmdUpdate handles: UPDATE type where condition set field = value
+func cmdUpdate(db *DB, args []string) error {
+	input := "UPDATE " + strings.Join(args, " ")
+	parsed, err := query.Parse(input)
+	if err != nil {
+		return err
+	}
+
+	if parsed.Command != "UPDATE" {
+		return fmt.Errorf("expected UPDATE command")
+	}
+
+	op := parsed.Update
+	results := db.queryEntities(op.TypeName, op.Conditions)
+
+	if len(results) == 0 {
+		fmt.Println("No matching records found.")
+		return nil
+	}
+
+	for _, entity := range results {
+		for attr, val := range op.SetFields {
+			valType := inferType(val)
+			if err := db.Store.Set(entity, attr, val, valType); err != nil {
+				return fmt.Errorf("failed to update %s.%s: %w", entity, attr, err)
+			}
+		}
+	}
+
+	fmt.Printf("Updated %d record(s)\n", len(results))
+	return nil
+}
+
+// cmdDeleteCmd handles: DELETE type where condition
+func cmdDeleteCmd(db *DB, args []string) error {
+	input := "DELETE " + strings.Join(args, " ")
+	parsed, err := query.Parse(input)
+	if err != nil {
+		return err
+	}
+
+	if parsed.Command != "DELETE" {
+		return fmt.Errorf("expected DELETE command")
+	}
+
+	op := parsed.Delete
+	results := db.queryEntities(op.TypeName, op.Conditions)
+
+	if len(results) == 0 {
+		fmt.Println("No matching records found.")
+		return nil
+	}
+
+	for _, entity := range results {
+		attrs := db.Store.GetAll(entity)
+		for attr := range attrs {
+			db.Store.Delete(entity, attr)
+		}
+	}
+
+	fmt.Printf("Deleted %d record(s)\n", len(results))
+	return nil
+}
+
+// cmdTypes lists all defined types.
+func cmdTypes(db *DB) error {
+	names := db.Schema.ListTypes()
+	if len(names) == 0 {
+		fmt.Println("No types defined. Use: type name { field: type }")
+		return nil
+	}
+
+	fmt.Println("Types:")
+	for _, name := range names {
+		td, _ := db.Schema.GetType(name)
+		fmt.Printf("  %s (%d fields)\n", name, len(td.Fields))
+		for _, f := range td.Fields {
+			opt := ""
+			if f.Optional {
+				opt = "?"
+			}
+			def := ""
+			if f.Default != nil {
+				def = fmt.Sprintf(" = %v", f.Default)
+			}
+			fmt.Printf("    %s: %s%s%s\n", f.Name, f.Type, opt, def)
+		}
+	}
+	return nil
+}
+
+// tryShorthandQuery tries to parse args as a shorthand query.
+// e.g., "person where age > 25" or "person.name where city == Lagos"
+func tryShorthandQuery(db *DB, args []string) error {
+	input := strings.Join(args, " ")
+	parsed, err := query.Parse(input)
+	if err != nil || parsed.Command != "SELECT" {
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", args[0])
+		printHelp()
+		return fmt.Errorf("unknown command: %s", args[0])
+	}
+
+	return executeSelect(db, parsed.Query)
+}
+
+// executeSelect runs a SELECT query and prints results.
+func executeSelect(db *DB, q *query.Query) error {
+	results := db.queryEntities(q.TypeName, q.Conditions)
+
+	if len(results) == 0 {
+		fmt.Println("No results found.")
+		return nil
+	}
+
+	// Build result rows
+	var rows []map[string]interface{}
+	for _, entity := range results {
+		attrs := db.Store.GetAll(entity)
+		row := make(map[string]interface{})
+		row["_entity"] = entity
+
+		if len(q.Fields) == 0 {
+			// Return all fields
+			for attr, a := range attrs {
+				row[attr] = a.Value
+			}
+		} else {
+			// Return specified fields
+			for _, f := range q.Fields {
+				if a, ok := attrs[f]; ok {
+					row[f] = a.Value
+				}
+			}
+		}
+		rows = append(rows, row)
+	}
+
+	// Sort
+	query.SortResults(rows, q.OrderBy)
+
+	// Limit
+	if q.Limit > 0 && q.Limit < len(rows) {
+		rows = rows[:q.Limit]
+	}
+
+	// Print
+	for _, row := range rows {
+		// Collect fields (skip _entity for display unless no specific fields)
+		var parts []string
+		if len(q.Fields) == 0 {
+			// Show entity + all fields
+			keys := make([]string, 0, len(row))
+			for k := range row {
+				if k != "_entity" {
+					keys = append(keys, k)
+				}
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				parts = append(parts, fmt.Sprintf("%s=%v", k, row[k]))
+			}
+			fmt.Printf("%s: %s\n", row["_entity"], strings.Join(parts, " "))
+		} else {
+			// Show specified fields
+			for _, f := range q.Fields {
+				if v, ok := row[f]; ok {
+					parts = append(parts, fmt.Sprintf("%s=%v", f, v))
+				}
+			}
+			fmt.Printf("%s.%s\n", row["_entity"], strings.Join(parts, " "))
+		}
+	}
+
+	fmt.Printf("(%d results)\n", len(rows))
+	return nil
+}
+
+// queryEntities finds all entities of a type matching conditions.
+func (db *DB) queryEntities(typeName string, conditions []query.Condition) []string {
+	prefix := typeName + ":"
+	var results []string
+	seen := make(map[string]bool)
+
+	db.Store.Query("", func(a *atom.Atom) bool {
+		if !strings.HasPrefix(a.Entity, prefix) {
+			return false
+		}
+		if seen[a.Entity] {
+			return false
+		}
+
+		attrs := db.Store.GetAll(a.Entity)
+		if attrs == nil {
+			return false
+		}
+
+		if query.MatchConditions(attrs, conditions) {
+			seen[a.Entity] = true
+			results = append(results, a.Entity)
+		}
+		return false
+	})
+
+	return results
+}
+
+// --- Raw commands (backward compatibility) ---
+
+func cmdSet(s *store.AtomStore, args []string) error {
+	if len(args) < 4 {
+		return fmt.Errorf("usage: set <entity> <attribute> <value> <type>")
+	}
+	entity, attribute, rawValue, valueType := args[0], args[1], args[2], args[3]
+	value, err := parseRawValue(rawValue, valueType)
+	if err != nil {
+		return err
+	}
+	if err := s.Set(entity, attribute, value, valueType); err != nil {
+		return err
+	}
+	fmt.Printf("Stored: %s.%s = %v\n", entity, attribute, value)
 	return nil
 }
 
@@ -95,23 +382,12 @@ func cmdGet(s *store.AtomStore, args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("usage: get <entity> <attribute>")
 	}
-
-	entity := args[0]
-	attribute := args[1]
-
-	a, ok := s.Get(entity, attribute)
+	a, ok := s.Get(args[0], args[1])
 	if !ok {
-		fmt.Printf("Not found: %s.%s\n", entity, attribute)
+		fmt.Printf("Not found: %s.%s\n", args[0], args[1])
 		return nil
 	}
-
-	fmt.Printf("Entity: %s\n", a.Entity)
-	fmt.Printf("Attribute: %s\n", a.Attribute)
-	fmt.Printf("Value: %v\n", a.Value)
-	fmt.Printf("Type: %s\n", a.Type)
-	fmt.Printf("Timestamp: %s\n", a.Timestamp.Format("2006-01-02 15:04:05.000000000"))
-	fmt.Printf("Version: %d\n", a.Version)
-
+	fmt.Printf("Entity: %s\nAttribute: %s\nValue: %v\nType: %s\n", a.Entity, a.Attribute, a.Value, a.Type)
 	return nil
 }
 
@@ -119,113 +395,52 @@ func cmdGetAll(s *store.AtomStore, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: getall <entity>")
 	}
-
-	entity := args[0]
-	attrs := s.GetAll(entity)
-
+	attrs := s.GetAll(args[0])
 	if len(attrs) == 0 {
-		fmt.Printf("No attributes found for: %s\n", entity)
+		fmt.Printf("No attributes found for: %s\n", args[0])
 		return nil
 	}
-
 	names := make([]string, 0, len(attrs))
-	for name := range attrs {
-		names = append(names, name)
+	for n := range attrs {
+		names = append(names, n)
 	}
 	sort.Strings(names)
-
-	for _, attr := range names {
-		a := attrs[attr]
-		fmt.Printf("%s.%s = %v (%s)\n", entity, attr, a.Value, a.Type)
+	for _, n := range names {
+		fmt.Printf("%s.%s = %v (%s)\n", args[0], n, attrs[n].Value, attrs[n].Type)
 	}
-
 	return nil
 }
 
 func cmdQuery(s *store.AtomStore, args []string) error {
 	if len(args) < 3 {
-		return fmt.Errorf("usage: query <attribute> <operator> <value> [AND|OR ...]")
+		return fmt.Errorf("usage: query <attribute> <op> <value>")
 	}
-
-	conditions := parseConditions(args)
-	if len(conditions) == 0 {
-		return fmt.Errorf("no valid conditions found")
-	}
-
-	var resultSets [][]*atom.Atom
-	for _, cond := range conditions {
-		results, err := executeCondition(s, cond)
-		if err != nil {
-			return err
-		}
-		resultSets = append(resultSets, results)
-	}
-
-	logic := "AND"
-	for _, cond := range conditions {
-		if cond.Logic != "" {
-			logic = cond.Logic
-		}
-	}
-	final := combineResults(resultSets, logic)
-
-	if len(final) == 0 {
+	attr, op, val := args[0], args[1], args[2]
+	results := s.Query(attr, func(a *atom.Atom) bool {
+		af := toFloatVal(a.Value)
+		bf, _ := strconv.ParseFloat(val, 64)
+		return compareVals(af, bf, op)
+	})
+	if len(results) == 0 {
 		fmt.Println("No results found.")
 		return nil
 	}
-
-	for _, a := range final {
+	for _, a := range results {
 		fmt.Printf("%s.%s = %v\n", a.Entity, a.Attribute, a.Value)
 	}
-
 	return nil
 }
 
 func cmdExplain(s *store.AtomStore, args []string) error {
 	if len(args) < 3 {
-		return fmt.Errorf("usage: explain <attribute> <operator> <value>")
+		return fmt.Errorf("usage: explain <attribute> <op> <value>")
 	}
-
-	attribute := args[0]
-	operator := args[1]
-	value := args[2]
-
-	if !isValidOperator(operator) {
-		return fmt.Errorf("unsupported operator %q", operator)
-	}
-
-	plan := s.QueryExplain(attribute, operator, value)
-
+	plan := s.QueryExplain(args[0], args[1], args[2])
 	if plan.UseIndex {
-		fmt.Printf("Using index on %s (%s scan)\n", plan.Attribute, plan.ScanType)
+		fmt.Printf("Index scan: %s (%s)\nEstimated rows: %d\n", plan.Attribute, plan.ScanType, plan.EstimatedRows)
 	} else {
-		fmt.Printf("Full scan (no index on %s)\n", plan.Attribute)
+		fmt.Printf("Full scan\nEstimated rows: %d\nRecommend: CREATE INDEX ON (%s)\n", plan.EstimatedRows, plan.Attribute)
 	}
-	fmt.Printf("Operator: %s\n", plan.Operator)
-	fmt.Printf("Value: %s\n", plan.Value)
-	fmt.Printf("Estimated cost: %d rows\n", plan.EstimatedRows)
-
-	return nil
-}
-
-func cmdDelete(s *store.AtomStore, args []string) error {
-	if len(args) < 2 {
-		return fmt.Errorf("usage: delete <entity> <attribute>")
-	}
-
-	entity := args[0]
-	attribute := args[1]
-
-	if !s.Exists(entity, attribute) {
-		fmt.Printf("Not found: %s.%s\n", entity, attribute)
-		return nil
-	}
-
-	if err := s.Delete(entity, attribute); err != nil {
-		return err
-	}
-
-	fmt.Printf("Deleted: %s.%s\n", entity, attribute)
 	return nil
 }
 
@@ -233,24 +448,10 @@ func cmdSearch(s *store.AtomStore, args []string) error {
 	if len(args) < 3 {
 		return fmt.Errorf("usage: search <attribute> contains <word>")
 	}
-
-	attribute := args[0]
-	if strings.ToLower(args[1]) != "contains" {
-		return fmt.Errorf("usage: search <attribute> contains <word>")
-	}
-	word := args[2]
-
-	results := s.FullTextSearch(attribute, word)
-
-	if len(results) == 0 {
-		fmt.Println("No results found.")
-		return nil
-	}
-
+	results := s.FullTextSearch(args[0], args[2])
 	for _, a := range results {
 		fmt.Printf("%s.%s = %v\n", a.Entity, a.Attribute, a.Value)
 	}
-
 	return nil
 }
 
@@ -258,44 +459,24 @@ func cmdIndex(s *store.AtomStore, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: index <list|rebuild>")
 	}
-
-	switch strings.ToLower(args[0]) {
+	switch args[0] {
 	case "list":
 		stats := s.Stats()
-		if len(stats.IndexedAttrs) == 0 {
-			fmt.Println("No indexes.")
-			return nil
+		for _, a := range stats.IndexedAttrs {
+			fmt.Printf("  %s\n", a)
 		}
-		fmt.Println("Indexed attributes:")
-		for _, attr := range stats.IndexedAttrs {
-			fmt.Printf("  %s\n", attr)
-		}
-		fmt.Printf("Total index keys: %d\n", stats.IndexKeyCount)
-		return nil
-
 	case "rebuild":
 		s.RebuildIndexes()
 		fmt.Println("Indexes rebuilt.")
-		return nil
-
-	default:
-		return fmt.Errorf("usage: index <list|rebuild>")
 	}
+	return nil
 }
 
 func cmdStats(s *store.AtomStore) error {
 	stats := s.Stats()
-
-	fmt.Printf("Entities: %d\n", stats.EntityCount)
-	fmt.Printf("Atoms: %d\n", stats.AtomCount)
-	fmt.Printf("Indexed attributes: %d\n", len(stats.IndexedAttrs))
-	fmt.Printf("Index keys: %d\n", stats.IndexKeyCount)
-	fmt.Printf("History size: %d\n", stats.HistorySize)
-
-	if len(stats.IndexedAttrs) > 0 {
-		fmt.Printf("Indexes: %s\n", strings.Join(stats.IndexedAttrs, ", "))
-	}
-
+	fmt.Printf("Entities: %d\nAtoms: %d\nIndexed: %d\nIndexes: %s\n",
+		stats.EntityCount, stats.AtomCount, len(stats.IndexedAttrs),
+		strings.Join(stats.IndexedAttrs, ", "))
 	return nil
 }
 
@@ -307,279 +488,97 @@ func cmdCompact(s *store.AtomStore) error {
 	return nil
 }
 
-type condition struct {
-	Attribute string
-	Operator  string
-	Value     string
-	Logic     string
-}
-
-func parseConditions(args []string) []condition {
-	var conditions []condition
-	current := condition{}
-	logic := ""
-
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		upper := strings.ToUpper(arg)
-
-		if upper == "AND" || upper == "OR" {
-			if current.Attribute != "" {
-				current.Logic = logic
-				conditions = append(conditions, current)
-				current = condition{}
-			}
-			logic = upper
-			continue
-		}
-
-		if current.Attribute == "" {
-			current.Attribute = arg
-		} else if current.Operator == "" {
-			current.Operator = arg
-		} else if current.Value == "" {
-			current.Value = arg
-		}
-	}
-
-	if current.Attribute != "" && current.Operator != "" {
-		current.Logic = logic
-		conditions = append(conditions, current)
-	}
-
-	return conditions
-}
-
-func executeCondition(s *store.AtomStore, cond condition) ([]*atom.Atom, error) {
-	if !isValidOperator(cond.Operator) {
-		return nil, fmt.Errorf("unsupported operator %q: use ==, !=, >, <, >=, <=", cond.Operator)
-	}
-
-	if cond.Operator == "==" {
-		if indexed := s.QueryIndexed(cond.Attribute, cond.Value); indexed != nil {
-			return indexed, nil
-		}
-	}
-
-	if cond.Operator == ">" || cond.Operator == ">=" || cond.Operator == "<" || cond.Operator == "<=" {
-		var op index.RangeOp
-		switch cond.Operator {
-		case ">":
-			op = index.OpGt
-		case ">=":
-			op = index.OpGte
-		case "<":
-			op = index.OpLt
-		case "<=":
-			op = index.OpLte
-		}
-		if indexed := s.QueryRange(cond.Attribute, op, cond.Value); indexed != nil {
-			return indexed, nil
-		}
-	}
-
-	searchValue := cond.Value
-	results := s.Query(cond.Attribute, func(a *atom.Atom) bool {
-		aFloat, aErr := toFloat64(a.Value)
-		sFloat, sErr := strconv.ParseFloat(searchValue, 64)
-
-		if aErr == nil && sErr == nil {
-			return compareFloats(aFloat, sFloat, cond.Operator)
-		}
-
-		aStr := fmt.Sprintf("%v", a.Value)
-		return compareStrings(aStr, searchValue, cond.Operator)
-	})
-
-	return results, nil
-}
-
-func combineResults(sets [][]*atom.Atom, primaryLogic string) []*atom.Atom {
-	if len(sets) == 0 {
-		return nil
-	}
-	if len(sets) == 1 {
-		return sets[0]
-	}
-
-	if strings.ToUpper(primaryLogic) == "OR" {
-		return unionAtoms(sets)
-	}
-	return intersectAtoms(sets)
-}
-
-func intersectAtoms(sets [][]*atom.Atom) []*atom.Atom {
-	if len(sets) == 0 {
-		return nil
-	}
-
-	entitySets := make([]map[string]bool, len(sets))
-	for i, set := range sets {
-		entities := make(map[string]bool)
-		for _, a := range set {
-			entities[a.Entity] = true
-		}
-		entitySets[i] = entities
-	}
-
-	commonEntities := make(map[string]bool)
-	for e := range entitySets[0] {
-		inAll := true
-		for i := 1; i < len(entitySets); i++ {
-			if !entitySets[i][e] {
-				inAll = false
-				break
-			}
-		}
-		if inAll {
-			commonEntities[e] = true
-		}
-	}
-
-	seen := make(map[string]bool)
-	var result []*atom.Atom
-	for _, a := range sets[0] {
-		if commonEntities[a.Entity] {
-			key := a.Entity + "." + a.Attribute
-			if !seen[key] {
-				seen[key] = true
-				result = append(result, a)
-			}
-		}
-	}
-	return result
-}
-
-func unionAtoms(sets [][]*atom.Atom) []*atom.Atom {
-	seen := make(map[string]bool)
-	var result []*atom.Atom
-
-	for _, set := range sets {
-		for _, a := range set {
-			key := a.Entity + "." + a.Attribute
-			if !seen[key] {
-				seen[key] = true
-				result = append(result, a)
-			}
-		}
-	}
-	return result
-}
-
-func parseValue(raw, valueType string) (interface{}, error) {
+func parseRawValue(raw, valueType string) (interface{}, error) {
 	switch strings.ToLower(valueType) {
 	case "string":
 		return raw, nil
 	case "number":
-		val, err := strconv.ParseFloat(raw, 64)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse %q as number: %w", raw, err)
-		}
-		return val, nil
+		return strconv.ParseFloat(raw, 64)
 	case "boolean", "bool":
-		val, err := strconv.ParseBool(raw)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse %q as boolean: %w", raw, err)
-		}
-		return val, nil
-	case "ref":
+		return strconv.ParseBool(raw)
+	default:
 		return raw, nil
-	case "timestamp":
-		return raw, nil
-	default:
-		return nil, fmt.Errorf("unsupported type: %s", valueType)
 	}
 }
 
-func toFloat64(v interface{}) (float64, error) {
-	switch val := v.(type) {
-	case float64:
-		return val, nil
-	case float32:
-		return float64(val), nil
-	case int:
-		return float64(val), nil
-	case int64:
-		return float64(val), nil
-	case json.Number:
-		return val.Float64()
-	default:
-		str := fmt.Sprintf("%v", val)
-		if f, err := strconv.ParseFloat(str, 64); err == nil {
-			return f, nil
-		}
-		return 0, fmt.Errorf("not a number")
+func parseRawVal(raw string) interface{} {
+	// Try number
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		return f
 	}
-}
-
-func compareFloats(a, b float64, op string) bool {
-	switch op {
-	case "==":
-		return a == b
-	case "!=":
-		return a != b
-	case ">":
-		return a > b
-	case "<":
-		return a < b
-	case ">=":
-		return a >= b
-	case "<=":
-		return a <= b
-	default:
-		return false
-	}
-}
-
-func compareStrings(a, b, op string) bool {
-	switch op {
-	case "==":
-		return a == b
-	case "!=":
-		return a != b
-	case ">":
-		return a > b
-	case "<":
-		return a < b
-	case ">=":
-		return a >= b
-	case "<=":
-		return a <= b
-	default:
-		return false
-	}
-}
-
-func isValidOperator(op string) bool {
-	switch op {
-	case "==", "!=", ">", "<", ">=", "<=":
+	// Try boolean
+	if raw == "true" {
 		return true
-	default:
+	}
+	if raw == "false" {
 		return false
+	}
+	return raw
+}
+
+func toFloatVal(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	default:
+		f, _ := strconv.ParseFloat(fmt.Sprintf("%v", v), 64)
+		return f
+	}
+}
+
+func compareVals(a, b float64, op string) bool {
+	switch op {
+	case ">":
+		return a > b
+	case "<":
+		return a < b
+	case ">=":
+		return a >= b
+	case "<=":
+		return a <= b
+	case "==":
+		return a == b
+	case "!=":
+		return a != b
+	}
+	return false
+}
+
+func inferType(v interface{}) string {
+	switch v.(type) {
+	case float64, float32, int, int64:
+		return "number"
+	case bool:
+		return "boolean"
+	default:
+		return "string"
 	}
 }
 
 func printHelp() {
-	fmt.Println("AtomDB - Local-first database built on atoms")
+	fmt.Println("AtomDB - Modern database with clean syntax")
 	fmt.Println()
-	fmt.Println("Commands:")
-	fmt.Println("  set <entity> <attribute> <value> <type>      Store an atom")
-	fmt.Println("  get <entity> <attribute>                     Retrieve an atom")
-	fmt.Println("  getall <entity>                              Get all attributes for entity")
-	fmt.Println("  query <attribute> <op> <value> [AND|OR ...]  Query atoms")
-	fmt.Println("  explain <attribute> <op> <value>             Show query execution plan")
-	fmt.Println("  delete <entity> <attribute>                  Delete an atom")
-	fmt.Println("  search <attribute> contains <word>           Full-text search")
-	fmt.Println("  index list                                   List indexed attributes")
-	fmt.Println("  index rebuild                                Rebuild all indexes")
-	fmt.Println("  stats                                        Show store statistics")
-	fmt.Println("  compact                                      Compact the data file")
-	fmt.Println("  help                                         Show this help")
+	fmt.Println("Types:")
+	fmt.Println("  type name { field: type, field: type? }    Define a type")
+	fmt.Println("  types                                       List all types")
+	fmt.Println()
+	fmt.Println("CRUD:")
+	fmt.Println("  insert type field:value [field:value ...]   Insert a record")
+	fmt.Println("  type where condition                        Query records")
+	fmt.Println("  update type where cond set field = value    Update records")
+	fmt.Println("  delete type where condition                 Delete records")
+	fmt.Println()
+	fmt.Println("Queries:")
+	fmt.Println("  person where age > 25                       Filter by field")
+	fmt.Println("  person.name where city == Lagos             Select specific fields")
+	fmt.Println("  person order by name limit 10               Sort and limit")
 	fmt.Println()
 	fmt.Println("Operators: ==, !=, >, <, >=, <=")
-	fmt.Println("Types: string, number, boolean, ref, timestamp")
+	fmt.Println("Types: string, number, boolean, ref")
 	fmt.Println()
-	fmt.Println("Examples:")
-	fmt.Println("  query age \">\" 25")
-	fmt.Println("  query age \">\" 25 AND city == Lagos")
+	fmt.Println("Raw commands: set, get, getall, query, explain, search, index, stats, compact")
 }

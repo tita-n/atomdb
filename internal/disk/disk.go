@@ -90,6 +90,21 @@ func Load(path string) ([]atom.Atom, error) {
 			continue
 		}
 
+		// Validate required fields
+		if da.Entity == "" || da.Attribute == "" {
+			log.Printf("WARNING: skipping line %d: missing required fields (entity or attribute empty)", lineNum)
+			continue
+		}
+
+		// Validate type is a known value
+		switch da.Type {
+		case "string", "number", "boolean", "ref", "timestamp", "deleted", "":
+			// valid
+		default:
+			log.Printf("WARNING: skipping line %d: unknown atom type %q", lineNum, da.Type)
+			continue
+		}
+
 		a := atom.Atom{
 			Entity:    da.Entity,
 			Attribute: da.Attribute,
