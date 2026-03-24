@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
 	"github.com/tita-n/atomdb/internal/atom"
@@ -136,7 +137,11 @@ func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType s
 	}
 
 	// Validate constraints
-	if err := s.constraints.Validate(entity, attribute, value, entity); err != nil {
+	typeName := entity
+	if idx := strings.Index(entity, ":"); idx > 0 {
+		typeName = entity[:idx]
+	}
+	if err := s.constraints.Validate(typeName, attribute, value, entity); err != nil {
 		return err
 	}
 
@@ -151,7 +156,7 @@ func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType s
 			s.idx.RemoveAtom(old)
 			// Remove old unique tracking
 			valStr := fmt.Sprintf("%v", old.Value)
-			s.constraints.RemoveUnique(entity, attribute, valStr)
+			s.constraints.RemoveUnique(typeName, attribute, valStr)
 		}
 	}
 
@@ -167,7 +172,7 @@ func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType s
 
 	// Track unique value
 	valStr := fmt.Sprintf("%v", value)
-	s.constraints.TrackUnique(entity, attribute, valStr, entity)
+	s.constraints.TrackUnique(typeName, attribute, valStr, entity)
 
 	return s.maybeSync()
 }

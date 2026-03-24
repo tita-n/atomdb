@@ -64,8 +64,10 @@ type TypeDef struct {
 
 // Schema manages all type definitions.
 type Schema struct {
-	mu    sync.RWMutex
-	types map[string]*TypeDef
+	mu         sync.RWMutex
+	types      map[string]*TypeDef
+	relations  *RelationManager
+	migrations *MigrationLog
 }
 
 const (
@@ -78,8 +80,20 @@ const (
 
 func New() *Schema {
 	return &Schema{
-		types: make(map[string]*TypeDef),
+		types:      make(map[string]*TypeDef),
+		relations:  NewRelationManager(),
+		migrations: NewMigrationLog(""),
 	}
+}
+
+// Relations returns the relation manager.
+func (s *Schema) Relations() *RelationManager {
+	return s.relations
+}
+
+// Migrations returns the migration log.
+func (s *Schema) Migrations() *MigrationLog {
+	return s.migrations
 }
 
 func validateIdentifier(name string) error {
@@ -489,7 +503,7 @@ func (s *Schema) LoadFromFile(path string) error {
 			}
 			fields = append(fields, FieldDef{
 				Name:     f.Name,
-				Type:     parseFieldType(f.Type),
+				Type:     ParseFieldType(f.Type),
 				RefType:  f.RefType,
 				Optional: f.Optional,
 				Default:  f.Default,
@@ -501,7 +515,8 @@ func (s *Schema) LoadFromFile(path string) error {
 	return nil
 }
 
-func parseFieldType(s string) FieldType {
+// ParseFieldType converts a string to a FieldType.
+func ParseFieldType(s string) FieldType {
 	switch s {
 	case "string":
 		return TypeString

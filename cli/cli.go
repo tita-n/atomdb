@@ -71,6 +71,26 @@ func Run(db *DB, args []string) error {
 		return cmdStats(db.Store)
 	case "compact":
 		return cmdCompact(db.Store)
+	case "backup":
+		return cmdBackup(db.Store, args[1:])
+	case "restore":
+		return cmdRestore(db.Store, args[1:])
+	case "constraint":
+		return cmdConstraint(db, args[1:])
+	case "constraints":
+		return cmdConstraints(db, args[1:])
+	case "relation":
+		return cmdRelation(db, args[1:])
+	case "relations":
+		return cmdRelations(db, args[1:])
+	case "migrate":
+		return cmdMigrate(db, args[1:])
+	case "migrations":
+		return cmdMigrations(db)
+	case "join":
+		return cmdJoin(db, args[1:])
+	case "tx":
+		return cmdTransaction(db, args[1:])
 	case "help":
 		printHelp()
 		return nil
@@ -770,8 +790,335 @@ func printHelp() {
 	fmt.Println("  person.name where city == Lagos             Select specific fields")
 	fmt.Println("  person order by name limit 10               Sort and limit")
 	fmt.Println()
+	fmt.Println("Transactions:")
+	fmt.Println("  tx begin|commit|rollback                    Transaction control")
+	fmt.Println()
+	fmt.Println("Constraints:")
+	fmt.Println("  constraint add type field unique|notnull    Add constraint")
+	fmt.Println("  constraints type                            List constraints")
+	fmt.Println()
+	fmt.Println("Relations:")
+	fmt.Println("  relation add from.field to.type cardinality  Add relation")
+	fmt.Println("  relations type                               List relations")
+	fmt.Println()
+	fmt.Println("Migrations:")
+	fmt.Println("  migrate add type field type                  Add field migration")
+	fmt.Println("  migrate remove type field                    Remove field migration")
+	fmt.Println("  migrations                                   List migrations")
+	fmt.Println()
+	fmt.Println("Backup:")
+	fmt.Println("  backup path                                  Create backup")
+	fmt.Println("  restore path                                 Restore from backup")
+	fmt.Println()
+	fmt.Println("Joins:")
+	fmt.Println("  join left.field right.type right.field       Join types")
+	fmt.Println()
+	fmt.Println("Aggregations:")
+	fmt.Println("  type where cond aggregate count|sum|avg|...")
+	fmt.Println()
 	fmt.Println("Operators: ==, !=, >, <, >=, <=")
 	fmt.Println("Types: string, number, boolean, ref")
 	fmt.Println()
 	fmt.Println("Raw commands: set, get, getall, query, explain, search, index, stats, compact")
+	fmt.Println("             backup, restore, constraint, relation, migrate, join, tx")
+}
+
+// cmdBackup creates a point-in-time backup.
+func cmdBackup(s *store.AtomStore, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: backup <path>")
+	}
+	path := args[0]
+	if err := s.Backup(path); err != nil {
+		return err
+	}
+	fmt.Printf("Backup created: %s\n", path)
+	return nil
+}
+
+// cmdRestore restores from a backup file.
+func cmdRestore(s *store.AtomStore, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: restore <path>")
+	}
+	path := args[0]
+	if err := s.Restore(path); err != nil {
+		return err
+	}
+	fmt.Printf("Restored from: %s\n", path)
+	return nil
+}
+
+// cmdConstraint adds a constraint.
+func cmdConstraint(db *DB, args []string) error {
+	if len(args) < 3 {
+		return fmt.Errorf("usage: constraint add <type> <field> <unique|notnull>")
+	}
+
+	action := args[0]
+	typeName := args[1]
+	fieldName := args[2]
+
+	switch action {
+	case "add":
+		if len(args) < 4 {
+			return fmt.Errorf("usage: constraint add <type> <field> <unique|notnull>")
+		}
+		constraintType := args[3]
+		var ct store.ConstraintType
+		switch constraintType {
+		case "unique":
+			ct = store.ConstraintUnique
+		case "notnull":
+			ct = store.ConstraintNotNull
+		default:
+			return fmt.Errorf("unknown constraint type: %q", constraintType)
+		}
+		db.Store.AddConstraint(store.Constraint{
+			Type:      ct,
+			TypeName:  typeName,
+			FieldName: fieldName,
+		})
+		fmt.Printf("Added %s constraint on %s.%s\n", constraintType, typeName, fieldName)
+	default:
+		return fmt.Errorf("unknown action: %q (use 'add')", action)
+	}
+	return nil
+}
+
+// cmdConstraints lists constraints for a type.
+func cmdConstraints(db *DB, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: constraints <type>")
+	}
+	typeName := args[0]
+	constraints := db.Store.ListConstraints(typeName)
+	if len(constraints) == 0 {
+		fmt.Printf("No constraints for type %q\n", typeName)
+		return nil
+	}
+	fmt.Printf("Constraints for %s:\n", typeName)
+	for _, c := range constraints {
+		var ct string
+		switch c.Type {
+		case store.ConstraintUnique:
+			ct = "UNIQUE"
+		case store.ConstraintNotNull:
+			ct = "NOT NULL"
+		case store.ConstraintCheck:
+			ct = "CHECK"
+		}
+		fmt.Printf("  %s: %s\n", c.FieldName, ct)
+	}
+	return nil
+}
+
+// cmdRelation manages type relations.
+func cmdRelation(db *DB, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: relation add <from.field> <to-type> <cardinality>")
+	}
+
+	action := args[0]
+	switch action {
+	case "add":
+		if len(args) < 4 {
+			return fmt.Errorf("usage: relation add <from.field> <to-type> <cardinality>")
+		}
+		fromParts := strings.SplitN(args[1], ".", 2)
+		if len(fromParts) != 2 {
+			return fmt.Errorf("expected from.field, got %q", args[1])
+		}
+		toType := args[2]
+		cardinality := args[3]
+
+		r := schema.Relation{
+			FromType:    fromParts[0],
+			FromField:   fromParts[1],
+			ToType:      toType,
+			ToField:     "id",
+			Cardinality: cardinality,
+		}
+		if err := db.Schema.Relations().AddRelation(r); err != nil {
+			return err
+		}
+		fmt.Printf("Added relation: %s.%s -> %s (%s)\n", fromParts[0], fromParts[1], toType, cardinality)
+
+	case "remove":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: relation remove <from.field>")
+		}
+		fromParts := strings.SplitN(args[1], ".", 2)
+		if len(fromParts) != 2 {
+			return fmt.Errorf("expected from.field, got %q", args[1])
+		}
+		db.Schema.Relations().RemoveRelation(fromParts[0], fromParts[1])
+		fmt.Printf("Removed relation: %s.%s\n", fromParts[0], fromParts[1])
+
+	default:
+		return fmt.Errorf("unknown action: %q (use 'add' or 'remove')", action)
+	}
+	return nil
+}
+
+// cmdRelations lists relations for a type.
+func cmdRelations(db *DB, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: relations <type>")
+	}
+	typeName := args[0]
+	relations := db.Schema.Relations().GetRelations(typeName)
+	if len(relations) == 0 {
+		fmt.Printf("No relations from type %q\n", typeName)
+		return nil
+	}
+	fmt.Printf("Relations from %s:\n", typeName)
+	for _, r := range relations {
+		fmt.Printf("  %s.%s -> %s (%s)\n", r.FromType, r.FromField, r.ToType, r.Cardinality)
+	}
+	return nil
+}
+
+// cmdMigrate handles schema migrations.
+func cmdMigrate(db *DB, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: migrate <add|remove> <type> <field> [type]")
+	}
+
+	action := args[0]
+	switch action {
+	case "add":
+		if len(args) < 4 {
+			return fmt.Errorf("usage: migrate add <type> <field> <field-type>")
+		}
+		typeName := args[1]
+		fieldName := args[2]
+		fieldType := args[3]
+
+		m := db.Schema.Migrations().AddField(typeName, schema.FieldDef{
+			Name:     fieldName,
+			Type:     schema.ParseFieldType(fieldType),
+			Optional: true,
+		})
+		if err := db.Schema.ApplyMigration(typeName, m); err != nil {
+			return err
+		}
+		db.Schema.Migrations().Record(m)
+		db.persistSchema()
+		fmt.Printf("Migration applied: %s\n", m.Name)
+
+	case "remove":
+		if len(args) < 3 {
+			return fmt.Errorf("usage: migrate remove <type> <field>")
+		}
+		typeName := args[1]
+		fieldName := args[2]
+
+		m := db.Schema.Migrations().RemoveField(typeName, fieldName)
+		if err := db.Schema.ApplyMigration(typeName, m); err != nil {
+			return err
+		}
+		db.Schema.Migrations().Record(m)
+		db.persistSchema()
+		fmt.Printf("Migration applied: %s\n", m.Name)
+
+	default:
+		return fmt.Errorf("unknown action: %q (use 'add' or 'remove')", action)
+	}
+	return nil
+}
+
+// cmdMigrations lists applied migrations.
+func cmdMigrations(db *DB) error {
+	migrations := db.Schema.Migrations().Applied()
+	if len(migrations) == 0 {
+		fmt.Println("No migrations applied")
+		return nil
+	}
+	fmt.Printf("Applied migrations (current version: %d):\n", db.Schema.Migrations().CurrentVersion())
+	for _, m := range migrations {
+		fmt.Printf("  v%d: %s (%s)\n", m.Version, m.Name, m.Timestamp.Format("2006-01-02 15:04:05"))
+	}
+	return nil
+}
+
+// cmdJoin performs a join query between two types.
+func cmdJoin(db *DB, args []string) error {
+	if len(args) < 4 {
+		return fmt.Errorf("usage: join <left.field> <right-type> <right-field> [where conditions]")
+	}
+
+	leftField := args[0]
+	rightType := args[1]
+	rightField := args[2]
+
+	// Get left type from field reference
+	leftParts := strings.SplitN(leftField, ".", 2)
+	if len(leftParts) != 2 {
+		return fmt.Errorf("expected left.field, got %q", leftField)
+	}
+	leftType := leftParts[0]
+	leftFieldName := leftParts[1]
+
+	// Fetch left entities
+	leftEntities := db.queryEntities(leftType, nil)
+	leftRows := make([]map[string]interface{}, 0, len(leftEntities))
+	for _, entity := range leftEntities {
+		attrs := db.Store.GetAll(entity)
+		row := make(map[string]interface{})
+		row["_entity"] = entity
+		for attr, a := range attrs {
+			row[attr] = a.Value
+		}
+		leftRows = append(leftRows, row)
+	}
+
+	// Fetch right entities
+	rightEntities := db.queryEntities(rightType, nil)
+	rightRows := make([]map[string]interface{}, 0, len(rightEntities))
+	for _, entity := range rightEntities {
+		attrs := db.Store.GetAll(entity)
+		row := make(map[string]interface{})
+		row["_entity"] = entity
+		for attr, a := range attrs {
+			row[attr] = a.Value
+		}
+		rightRows = append(rightRows, row)
+	}
+
+	// Perform join
+	results := schema.Join(leftRows, rightRows, leftFieldName, rightField)
+
+	// Print results
+	fmt.Printf("Join results (%d rows):\n", len(results))
+	for _, row := range results {
+		var parts []string
+		for k, v := range row {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+		}
+		sort.Strings(parts)
+		fmt.Println(strings.Join(parts, " "))
+	}
+	return nil
+}
+
+// cmdTransaction handles transaction control.
+func cmdTransaction(db *DB, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: tx <begin|commit|rollback>")
+	}
+
+	action := args[0]
+	switch action {
+	case "begin":
+		fmt.Println("Transaction support available via WithTransaction() API")
+		fmt.Println("Example: store.WithTransaction(func(tx *store.Transaction) error { ... })")
+	case "commit":
+		fmt.Println("Use transaction.Commit() in code")
+	case "rollback":
+		fmt.Println("Use transaction.Rollback() in code")
+	default:
+		return fmt.Errorf("unknown action: %q (use 'begin', 'commit', 'rollback')", action)
+	}
+	return nil
 }
