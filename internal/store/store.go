@@ -37,6 +37,7 @@ type AtomStore struct {
 	mu                   sync.RWMutex
 	atoms                map[string]map[string]*atom.Atom
 	idx                  *index.IndexManager
+	constraints          *ConstraintManager
 	history              []atom.Atom
 	file                 *os.File
 	dirty                bool
@@ -75,12 +76,13 @@ func NewWithModeAndLimits(path string, mode SyncMode, limits StoreLimits) (*Atom
 	}
 
 	store := &AtomStore{
-		atoms:    make(map[string]map[string]*atom.Atom),
-		idx:      index.NewIndexManager(),
-		history:  make([]atom.Atom, 0),
-		file:     file,
-		syncMode: mode,
-		limits:   limits,
+		atoms:       make(map[string]map[string]*atom.Atom),
+		idx:         index.NewIndexManager(),
+		constraints: NewConstraintManager(),
+		history:     make([]atom.Atom, 0),
+		file:        file,
+		syncMode:    mode,
+		limits:      limits,
 	}
 
 	// Replay atoms to rebuild in-memory index and populate history
@@ -133,6 +135,11 @@ func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType s
 		return fmt.Errorf("maximum atom count (%d) exceeded", s.limits.MaxAtoms)
 	}
 
+	// Validate constraints
+	if err := s.constraints.Validate(entity, attribute, value, entity); err != nil {
+		return err
+	}
+
 	a, err := atom.NewAtom(entity, attribute, value, valueType)
 	if err != nil {
 		return err
@@ -142,6 +149,9 @@ func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType s
 	if oldAttrs, ok := s.atoms[entity]; ok {
 		if old, exists := oldAttrs[attribute]; exists && old.Type != "deleted" {
 			s.idx.RemoveAtom(old)
+			// Remove old unique tracking
+			valStr := fmt.Sprintf("%v", old.Value)
+			s.constraints.RemoveUnique(entity, attribute, valStr)
 		}
 	}
 
@@ -154,6 +164,10 @@ func (s *AtomStore) Set(entity, attribute string, value interface{}, valueType s
 	s.applyAtom(a)
 	s.idx.IndexAtom(a)
 	s.appendHistory(*a)
+
+	// Track unique value
+	valStr := fmt.Sprintf("%v", value)
+	s.constraints.TrackUnique(entity, attribute, valStr, entity)
 
 	return s.maybeSync()
 }
@@ -230,6 +244,13 @@ func (s *AtomStore) Query(attribute string, predicate func(*atom.Atom) bool) []*
 		}
 	}
 	return results
+}
+
+// HasIndex returns true if an index exists for the given attribute.
+func (s *AtomStore) HasIndex(attribute string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.idx.HasIndex(attribute)
 }
 
 func (s *AtomStore) QueryIndexed(attribute, value string) []*atom.Atom {
@@ -360,6 +381,16 @@ func (s *AtomStore) Delete(entity, attribute string) error {
 }
 
 var ErrNotFound = fmt.Errorf("not found")
+
+// AddConstraint registers a constraint on the store.
+func (s *AtomStore) AddConstraint(c Constraint) {
+	s.constraints.AddConstraint(c)
+}
+
+// ListConstraints returns all constraints for a type.
+func (s *AtomStore) ListConstraints(typeName string) []Constraint {
+	return s.constraints.ListConstraints(typeName)
+}
 
 // Compact rewrites the data file. Holds full Lock for the entire operation
 // to prevent concurrent writes to the closed file handle.

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/tita-n/atomdb/internal/atom"
+	"github.com/tita-n/atomdb/internal/index"
 	"github.com/tita-n/atomdb/internal/query"
 	"github.com/tita-n/atomdb/internal/schema"
 	"github.com/tita-n/atomdb/internal/store"
@@ -15,9 +16,10 @@ import (
 
 // DB holds the store and schema for CLI operations.
 type DB struct {
-	Store   *store.AtomStore
-	Schema  *schema.Schema
-	DataDir string
+	Store          *store.AtomStore
+	Schema         *schema.Schema
+	DataDir        string
+	SchemaEnforced bool
 }
 
 func NewDB(s *store.AtomStore, sc *schema.Schema, dataDir string) *DB {
@@ -137,7 +139,8 @@ func cmdInsert(db *DB, args []string) error {
 	// Check if we need a better ID (use a name-like field if present)
 	for _, idField := range []string{"name", "id", "email", "title"} {
 		if v, ok := validated[idField]; ok {
-			entity = fmt.Sprintf("%s:%v", typeName, v)
+			safeID := sanitizeEntityIDValue(v)
+			entity = fmt.Sprintf("%s:%s", typeName, safeID)
 			break
 		}
 	}
@@ -332,11 +335,42 @@ func executeSelect(db *DB, q *query.Query) error {
 }
 
 // queryEntities finds all entities of a type matching conditions.
+// Uses indexes when available, falls back to full scan otherwise.
 func (db *DB) queryEntities(typeName string, conditions []query.Condition) []string {
 	prefix := typeName + ":"
+
+	// Try to use index for the first equality condition on an indexed field
+	candidateEntities := db.resolveCandidatesViaIndex(prefix, conditions)
+
 	var results []string
 	seen := make(map[string]bool)
 
+	// If we got candidates from index, filter them further
+	if candidateEntities != nil {
+		for _, entity := range candidateEntities {
+			if !strings.HasPrefix(entity, prefix) {
+				continue
+			}
+			if seen[entity] {
+				continue
+			}
+			attrs := db.Store.GetAll(entity)
+			if attrs == nil {
+				continue
+			}
+			// Validate types at query time
+			if err := db.validateQueryAttrs(typeName, attrs); err != nil {
+				continue
+			}
+			if query.MatchConditions(attrs, conditions) {
+				seen[entity] = true
+				results = append(results, entity)
+			}
+		}
+		return results
+	}
+
+	// Fall back to full scan
 	db.Store.Query("", func(a *atom.Atom) bool {
 		if !strings.HasPrefix(a.Entity, prefix) {
 			return false
@@ -349,7 +383,10 @@ func (db *DB) queryEntities(typeName string, conditions []query.Condition) []str
 		if attrs == nil {
 			return false
 		}
-
+		// Validate types at query time
+		if err := db.validateQueryAttrs(typeName, attrs); err != nil {
+			return false
+		}
 		if query.MatchConditions(attrs, conditions) {
 			seen[a.Entity] = true
 			results = append(results, a.Entity)
@@ -358,6 +395,133 @@ func (db *DB) queryEntities(typeName string, conditions []query.Condition) []str
 	})
 
 	return results
+}
+
+// resolveCandidatesViaIndex attempts to use B-Tree indexes to narrow candidate set.
+// Returns nil if no suitable index found (caller should fall back to full scan).
+func (db *DB) resolveCandidatesViaIndex(prefix string, conditions []query.Condition) []string {
+	if len(conditions) == 0 {
+		return nil
+	}
+
+	// Find the first condition on an indexed field
+	for _, cond := range conditions {
+		if !db.Store.HasIndex(cond.Field) {
+			continue
+		}
+
+		var atoms []*atom.Atom
+		switch cond.Operator {
+		case "==":
+			valStr := fmt.Sprintf("%v", cond.Value)
+			atoms = db.Store.QueryIndexed(cond.Field, valStr)
+		case ">", ">=", "<", "<=":
+			valStr := fmt.Sprintf("%v", cond.Value)
+			var rangeOp index.RangeOp
+			switch cond.Operator {
+			case ">":
+				rangeOp = index.OpGt
+			case ">=":
+				rangeOp = index.OpGte
+			case "<":
+				rangeOp = index.OpLt
+			case "<=":
+				rangeOp = index.OpLte
+			}
+			atoms = db.Store.QueryRange(cond.Field, rangeOp, valStr)
+		default:
+			continue
+		}
+
+		if len(atoms) == 0 {
+			return []string{} // Index says no matches
+		}
+
+		// Extract unique entity names, filtered by type prefix
+		entities := make([]string, 0, len(atoms))
+		seen := make(map[string]bool)
+		for _, a := range atoms {
+			if strings.HasPrefix(a.Entity, prefix) && !seen[a.Entity] {
+				seen[a.Entity] = true
+				entities = append(entities, a.Entity)
+			}
+		}
+		return entities
+	}
+
+	return nil // No usable index found
+}
+
+// validateQueryAttrs checks that attribute values match the schema type definition.
+func (db *DB) validateQueryAttrs(typeName string, attrs map[string]*atom.Atom) error {
+	td, ok := db.Schema.GetType(typeName)
+	if !ok {
+		return nil // No schema defined, skip validation
+	}
+
+	for _, fd := range td.Fields {
+		a, exists := attrs[fd.Name]
+		if !exists {
+			if !fd.Optional && fd.Default == nil {
+				return fmt.Errorf("missing required field %q", fd.Name)
+			}
+			continue
+		}
+		if a.Type == "deleted" {
+			continue
+		}
+		if err := validateAtomType(fd, a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateAtomType checks an atom's value matches the expected field type.
+func validateAtomType(fd schema.FieldDef, a *atom.Atom) error {
+	if a.Value == nil {
+		if fd.Optional {
+			return nil
+		}
+		return fmt.Errorf("field %q cannot be nil", fd.Name)
+	}
+	switch fd.Type {
+	case schema.TypeString:
+		if _, ok := a.Value.(string); !ok {
+			return fmt.Errorf("field %q: expected string, got %T", fd.Name, a.Value)
+		}
+	case schema.TypeNumber:
+		switch a.Value.(type) {
+		case float64, float32, int, int64:
+			// ok
+		default:
+			return fmt.Errorf("field %q: expected number, got %T", fd.Name, a.Value)
+		}
+	case schema.TypeBoolean:
+		if _, ok := a.Value.(bool); !ok {
+			return fmt.Errorf("field %q: expected boolean, got %T", fd.Name, a.Value)
+		}
+	case schema.TypeEnum:
+		s, ok := a.Value.(string)
+		if !ok {
+			return fmt.Errorf("field %q: expected string for enum, got %T", fd.Name, a.Value)
+		}
+		found := false
+		for _, ev := range fd.EnumVals {
+			if ev == s {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("field %q: invalid enum value %q", fd.Name, s)
+		}
+	case schema.TypeRef:
+		if _, ok := a.Value.(string); !ok {
+			return fmt.Errorf("field %q: expected string reference, got %T", fd.Name, a.Value)
+		}
+	}
+	return nil
 }
 
 // --- Raw commands (backward compatibility) ---
@@ -371,10 +535,11 @@ func cmdSet(s *store.AtomStore, args []string) error {
 	if err != nil {
 		return err
 	}
+	fmt.Printf("WARNING: raw 'set' command bypasses schema validation\n")
+	fmt.Printf("Stored: %s.%s = %v\n", entity, attribute, value)
 	if err := s.Set(entity, attribute, value, valueType); err != nil {
 		return err
 	}
-	fmt.Printf("Stored: %s.%s = %v\n", entity, attribute, value)
 	return nil
 }
 
@@ -556,6 +721,34 @@ func inferType(v interface{}) string {
 		return "boolean"
 	default:
 		return "string"
+	}
+}
+
+func sanitizeEntityIDValue(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		safe := strings.ReplaceAll(val, ":", "_")
+		safe = strings.ReplaceAll(safe, "/", "_")
+		safe = strings.ReplaceAll(safe, "\\", "_")
+		safe = strings.ReplaceAll(safe, "\n", "_")
+		safe = strings.ReplaceAll(safe, "\r", "_")
+		if len(safe) > 256 {
+			safe = safe[:256]
+		}
+		return safe
+	case float64:
+		return fmt.Sprintf("n%d", int(val))
+	case int:
+		return fmt.Sprintf("n%d", val)
+	case int64:
+		return fmt.Sprintf("n%d", val)
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
+	default:
+		return "unknown"
 	}
 }
 

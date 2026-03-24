@@ -631,3 +631,90 @@ func SortResults(results []map[string]interface{}, orderBy *OrderBy) {
 		return fi < fj
 	})
 }
+
+// Aggregate computes an aggregate function over result rows.
+func Aggregate(rows []map[string]interface{}, fn string, field string) (interface{}, error) {
+	if len(rows) == 0 {
+		switch fn {
+		case "count":
+			return 0, nil
+		default:
+			return nil, fmt.Errorf("no rows to aggregate")
+		}
+	}
+
+	switch fn {
+	case "count":
+		return float64(len(rows)), nil
+
+	case "sum":
+		var total float64
+		for _, row := range rows {
+			if v, ok := row[field]; ok && v != nil {
+				total += toFloat(v)
+			}
+		}
+		return total, nil
+
+	case "avg":
+		var total float64
+		count := 0
+		for _, row := range rows {
+			if v, ok := row[field]; ok && v != nil {
+				total += toFloat(v)
+				count++
+			}
+		}
+		if count == 0 {
+			return nil, fmt.Errorf("no non-null values for avg")
+		}
+		return total / float64(count), nil
+
+	case "min":
+		var min float64
+		found := false
+		for _, row := range rows {
+			if v, ok := row[field]; ok && v != nil {
+				f := toFloat(v)
+				if !found || f < min {
+					min = f
+					found = true
+				}
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("no non-null values for min")
+		}
+		return min, nil
+
+	case "max":
+		var max float64
+		found := false
+		for _, row := range rows {
+			if v, ok := row[field]; ok && v != nil {
+				f := toFloat(v)
+				if !found || f > max {
+					max = f
+					found = true
+				}
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("no non-null values for max")
+		}
+		return max, nil
+
+	default:
+		return nil, fmt.Errorf("unknown aggregate function: %q", fn)
+	}
+}
+
+// GroupByResults groups rows by a field value.
+func GroupByResults(rows []map[string]interface{}, groupField string) map[string][]map[string]interface{} {
+	groups := make(map[string][]map[string]interface{})
+	for _, row := range rows {
+		key := fmt.Sprintf("%v", row[groupField])
+		groups[key] = append(groups[key], row)
+	}
+	return groups
+}

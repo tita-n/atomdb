@@ -105,6 +105,14 @@ func Load(path string) ([]atom.Atom, error) {
 			continue
 		}
 
+		// Validate value size for strings
+		if s, ok := da.Value.(string); ok {
+			if len(s) > 1048576 { // MaxValueLength
+				log.Printf("WARNING: skipping line %d: value exceeds maximum length", lineNum)
+				continue
+			}
+		}
+
 		a := atom.Atom{
 			Entity:    da.Entity,
 			Attribute: da.Attribute,

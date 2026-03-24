@@ -2,11 +2,13 @@ package schema
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
 )
 
 // FieldType represents the type of a field in a type definition.
@@ -66,17 +68,82 @@ type Schema struct {
 	types map[string]*TypeDef
 }
 
+const (
+	MaxTypes         = 1000
+	MaxFieldsPerType = 100
+	MaxEnumVals      = 100
+	MaxNameLength    = 256
+	MaxDefaultLen    = 1024
+)
+
 func New() *Schema {
 	return &Schema{
 		types: make(map[string]*TypeDef),
 	}
 }
 
+func validateIdentifier(name string) error {
+	if name == "" {
+		return errors.New("name cannot be empty")
+	}
+	if len(name) > MaxNameLength {
+		return fmt.Errorf("name exceeds maximum length of %d bytes", MaxNameLength)
+	}
+	for i, r := range name {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("name contains control character at position %d", i)
+		}
+		if r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+			return fmt.Errorf("name contains unsafe character %q at position %d", r, i)
+		}
+		if r == '\u2028' || r == '\u2029' {
+			return fmt.Errorf("name contains Unicode line separator at position %d", i)
+		}
+	}
+	return nil
+}
+
+func validateDefaultValue(val interface{}) error {
+	if val == nil {
+		return nil
+	}
+	if s, ok := val.(string); ok {
+		if len(s) > MaxDefaultLen {
+			return fmt.Errorf("default value exceeds maximum length of %d bytes", MaxDefaultLen)
+		}
+	}
+	return nil
+}
+
 // DefineType parses and registers a type definition.
 // Input format: TYPE name { field: type, field: type?, field: default_type = value }
 func (s *Schema) DefineType(name string, fields []FieldDef) error {
+	if err := validateIdentifier(name); err != nil {
+		return fmt.Errorf("invalid type name: %w", err)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if len(s.types) >= MaxTypes {
+		return fmt.Errorf("maximum number of types (%d) exceeded", MaxTypes)
+	}
+
+	if len(fields) > MaxFieldsPerType {
+		return fmt.Errorf("type %q has too many fields (max %d)", name, MaxFieldsPerType)
+	}
+
+	for _, fd := range fields {
+		if err := validateIdentifier(fd.Name); err != nil {
+			return fmt.Errorf("invalid field name: %w", err)
+		}
+		if len(fd.EnumVals) > MaxEnumVals {
+			return fmt.Errorf("field %q has too many enum values (max %d)", fd.Name, MaxEnumVals)
+		}
+		if err := validateDefaultValue(fd.Default); err != nil {
+			return fmt.Errorf("field %q: %w", fd.Name, err)
+		}
+	}
 
 	s.types[name] = &TypeDef{
 		Name:   name,
@@ -229,6 +296,9 @@ func ParseTypeDefinition(input string) (string, []FieldDef, error) {
 	}
 
 	name := strings.TrimSpace(rest[:openBrace])
+	if err := validateIdentifier(name); err != nil {
+		return "", nil, fmt.Errorf("invalid type name: %w", err)
+	}
 	body := rest[openBrace+1:]
 
 	closeBrace := strings.LastIndex(body, "}")
@@ -403,8 +473,20 @@ func (s *Schema) LoadFromFile(path string) error {
 	defer s.mu.Unlock()
 
 	for _, d := range defs {
+		if err := validateIdentifier(d.Name); err != nil {
+			return fmt.Errorf("invalid type name %q: %w", d.Name, err)
+		}
+		if len(s.types) >= MaxTypes {
+			return fmt.Errorf("maximum number of types (%d) exceeded in schema file", MaxTypes)
+		}
 		var fields []FieldDef
 		for _, f := range d.Fields {
+			if err := validateIdentifier(f.Name); err != nil {
+				return fmt.Errorf("invalid field name %q: %w", f.Name, err)
+			}
+			if err := validateDefaultValue(f.Default); err != nil {
+				return fmt.Errorf("field %q: %w", f.Name, err)
+			}
 			fields = append(fields, FieldDef{
 				Name:     f.Name,
 				Type:     parseFieldType(f.Type),
