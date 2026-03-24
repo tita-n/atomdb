@@ -76,20 +76,21 @@ func sanitizePath(p string) (string, error) {
 	if strings.ContainsRune(p, 0) {
 		return "", fmt.Errorf("invalid database path: contains null byte")
 	}
-	p = filepath.Clean(p)
 
-	// On Windows, filepath.IsAbs returns false for drive-relative paths like "C:foo"
-	// We need to resolve and validate containment after cleaning
 	if filepath.IsAbs(p) {
-		return "", fmt.Errorf("invalid database path: must not be absolute")
+		cleaned := filepath.Clean(p)
+		if strings.Contains(cleaned, "..") {
+			return "", fmt.Errorf("invalid database path: must not contain '..'")
+		}
+		return cleaned, nil
 	}
 
-	// Check for ".." after cleaning (covers C:..\foo patterns)
+	p = filepath.Clean(p)
+
 	if strings.Contains(p, "..") {
 		return "", fmt.Errorf("invalid database path: must not contain '..'")
 	}
 
-	// Validate Windows drive-relative paths don't escape intended directory
 	if err := validateDirPath(p); err != nil {
 		return "", fmt.Errorf("invalid database path: %w", err)
 	}

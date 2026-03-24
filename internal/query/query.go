@@ -14,6 +14,7 @@ type Condition struct {
 	Field    string
 	Operator string // ==, !=, >, <, >=, <=
 	Value    interface{}
+	Logic    string // AND or OR to next condition (empty for last)
 }
 
 // OrderBy represents an ORDER BY clause.
@@ -27,7 +28,6 @@ type Query struct {
 	TypeName   string
 	Fields     []string // fields to return (empty = all)
 	Conditions []Condition
-	Logic      string // AND or OR between conditions
 	OrderBy    *OrderBy
 	Limit      int
 	GroupBy    string
@@ -268,12 +268,9 @@ func parseSelect(input string) (*ParsedInput, error) {
 			next := strings.ToLower(strings.TrimSpace(parts[1]))
 			if strings.HasPrefix(next, "desc") {
 				desc = true
-			}
-			input = strings.TrimSpace(parts[1])
-			if desc {
-				input = strings.TrimPrefix(input, "desc")
-				input = strings.TrimPrefix(input, "DESC")
-				input = strings.TrimSpace(input)
+				input = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(parts[1]), "desc"))
+			} else {
+				input = strings.TrimSpace(parts[1])
 			}
 		} else {
 			input = ""
@@ -300,13 +297,12 @@ func parseSelect(input string) (*ParsedInput, error) {
 func parseShorthand(input string) (*ParsedInput, error) {
 	// "person where age > 25" → SELECT * FROM person WHERE age > 25
 	// "person.name where city == Lagos" → SELECT name FROM person WHERE city == "Lagos"
+	// Supports: "person order by name limit 10 where age > 25"
 
 	lower := strings.ToLower(input)
 
-	// Find "where"
 	whereIdx := strings.Index(lower, " where ")
 	if whereIdx < 0 {
-		// Just a type name - return all
 		return &ParsedInput{
 			Command: "SELECT",
 			Query: &Query{
@@ -320,9 +316,76 @@ func parseShorthand(input string) (*ParsedInput, error) {
 
 	q := &Query{}
 
-	// Parse "type.field1, field2" or just "type"
+	typeAndClauses := strings.TrimSpace(beforeWhere)
+	orderIdx := strings.Index(strings.ToLower(typeAndClauses), " order by ")
+	limitIdx := strings.Index(strings.ToLower(typeAndClauses), " limit ")
+
+	if orderIdx >= 0 && (limitIdx < 0 || orderIdx < limitIdx) {
+		typePart := strings.TrimSpace(typeAndClauses[:orderIdx])
+		rest := strings.TrimSpace(typeAndClauses[orderIdx+10:])
+		q.TypeName = extractTypeAndFields(typePart, q)
+		rest = parseOrderByAndLimit(rest, q)
+	} else if limitIdx >= 0 {
+		typePart := strings.TrimSpace(typeAndClauses[:limitIdx])
+		rest := strings.TrimSpace(typeAndClauses[limitIdx+7:])
+		q.TypeName = extractTypeAndFields(typePart, q)
+		if n, err := strconv.Atoi(strings.TrimSpace(strings.Fields(rest)[0])); err == nil {
+			q.Limit = n
+		}
+	} else {
+		q.TypeName = extractTypeAndFields(typeAndClauses, q)
+	}
+
+	conditions, err := parseWhere(afterWhere)
+	if err != nil {
+		return nil, err
+	}
+	q.Conditions = conditions
+
+	// Also extract ORDER BY and LIMIT from afterWhere (after "where")
+	if q.OrderBy == nil {
+		afterWhereLower := strings.ToLower(afterWhere)
+		orderIdx := strings.Index(afterWhereLower, " order by ")
+		limitIdx := strings.Index(afterWhereLower, " limit ")
+
+		if orderIdx >= 0 && (limitIdx < 0 || orderIdx < limitIdx) {
+			beforeOrder := strings.TrimSpace(afterWhere[:orderIdx])
+			q.Conditions, _ = parseWhere(beforeOrder)
+			remaining := strings.TrimSpace(afterWhere[orderIdx+10:])
+			parts := strings.SplitN(remaining, " ", 2)
+			field := strings.TrimSpace(parts[0])
+			desc := false
+			rest := ""
+			if len(parts) > 1 {
+				rest = strings.TrimSpace(parts[1])
+				if strings.HasPrefix(strings.ToLower(rest), "desc") {
+					desc = true
+					rest = strings.TrimSpace(rest[4:])
+				}
+			}
+			q.OrderBy = &OrderBy{Field: field, Desc: desc}
+			if rest != "" {
+				restLower := strings.ToLower(rest)
+				li := strings.Index(restLower, "limit ")
+				if li >= 0 {
+					q.Limit, _ = strconv.Atoi(strings.TrimSpace(strings.Fields(strings.TrimSpace(rest[li+6:]))[0]))
+				}
+			}
+		} else if limitIdx >= 0 && q.Limit == 0 {
+			beforeLimit := strings.TrimSpace(afterWhere[:limitIdx])
+			q.Conditions, _ = parseWhere(beforeLimit)
+			q.Limit, _ = strconv.Atoi(strings.TrimSpace(strings.Fields(strings.TrimSpace(afterWhere[limitIdx+7:]))[0]))
+		}
+	}
+
+	return &ParsedInput{
+		Command: "SELECT",
+		Query:   q,
+	}, nil
+}
+
+func extractTypeAndFields(beforeWhere string, q *Query) string {
 	if strings.Contains(beforeWhere, ".") {
-		// Split on spaces to get individual type.field pairs
 		parts := strings.Fields(beforeWhere)
 		typeName := ""
 		for _, part := range parts {
@@ -336,22 +399,41 @@ func parseShorthand(input string) (*ParsedInput, error) {
 				typeName = part
 			}
 		}
-		q.TypeName = typeName
-	} else {
-		q.TypeName = beforeWhere
+		return typeName
 	}
+	return beforeWhere
+}
 
-	// Parse conditions
-	conditions, err := parseWhere(afterWhere)
-	if err != nil {
-		return nil, err
+func parseOrderByAndLimit(rest string, q *Query) string {
+	parts := strings.SplitN(rest, " ", 2)
+	field := strings.TrimSpace(parts[0])
+	desc := false
+	remaining := ""
+	if len(parts) > 1 {
+		remaining = strings.TrimSpace(parts[1])
+		lowerNext := strings.ToLower(remaining)
+		if strings.HasPrefix(lowerNext, "desc") {
+			desc = true
+			remaining = strings.TrimSpace(remaining[4:])
+		} else if strings.HasPrefix(lowerNext, "asc") {
+			desc = false
+			remaining = strings.TrimSpace(remaining[3:])
+		}
 	}
-	q.Conditions = conditions
+	q.OrderBy = &OrderBy{Field: field, Desc: desc}
 
-	return &ParsedInput{
-		Command: "SELECT",
-		Query:   q,
-	}, nil
+	if remaining != "" {
+		lowerRem := strings.ToLower(remaining)
+		li := strings.Index(lowerRem, "limit ")
+		if li >= 0 {
+			limitStr := strings.TrimSpace(remaining[li+6:])
+			if n, err := strconv.Atoi(strings.TrimSpace(strings.Fields(limitStr)[0])); err == nil {
+				q.Limit = n
+			}
+			remaining = strings.TrimSpace(remaining[:li])
+		}
+	}
+	return remaining
 }
 
 // parseWhere parses WHERE clause conditions.
@@ -374,20 +456,22 @@ func parseWhere(input string) ([]Condition, error) {
 			return nil, fmt.Errorf("expected operator, got %q", op)
 		}
 
+		logic := ""
+		i += 3
+		if i < len(tokens) {
+			upper := strings.ToUpper(tokens[i])
+			if upper == "AND" || upper == "OR" {
+				logic = upper
+				i++
+			}
+		}
+
 		conditions = append(conditions, Condition{
 			Field:    field,
 			Operator: op,
 			Value:    parseValue(val),
+			Logic:    logic,
 		})
-
-		i += 3
-		// Skip AND/OR
-		if i < len(tokens) {
-			upper := strings.ToUpper(tokens[i])
-			if upper == "AND" || upper == "OR" {
-				i++
-			}
-		}
 	}
 
 	return conditions, nil
@@ -524,16 +608,19 @@ func parseFieldPairs(input string) (map[string]interface{}, error) {
 
 func parseSetPairs(input string) (map[string]interface{}, error) {
 	fields := make(map[string]interface{})
-	// field = value, field = value
-	parts := strings.Split(input, ",")
-	for _, part := range parts {
-		eqIdx := strings.Index(part, "=")
-		if eqIdx < 0 {
+	if input == "" {
+		return fields, nil
+	}
+	tokens := tokenizeWhere(input)
+	i := 0
+	for i < len(tokens) {
+		field := tokens[i]
+		if i+2 < len(tokens) && tokens[i+1] == "=" {
+			fields[field] = parseValue(tokens[i+2])
+			i += 3
 			continue
 		}
-		field := strings.TrimSpace(part[:eqIdx])
-		val := strings.TrimSpace(part[eqIdx+1:])
-		fields[field] = parseValue(val)
+		i++
 	}
 	return fields, nil
 }
@@ -552,24 +639,41 @@ func findClauseIndex(input string) int {
 }
 
 // MatchConditions checks if an entity's attributes satisfy the conditions.
+// Each top-level OR-separated group must pass (AND within group).
+// e.g. "age > 25 OR name == 'John'" evaluates as two OR groups.
 func MatchConditions(attrs map[string]*atom.Atom, conditions []Condition) bool {
 	if len(conditions) == 0 {
 		return true
 	}
 
-	for _, cond := range conditions {
-		a, ok := attrs[cond.Field]
-		if !ok {
-			return false
-		}
-		if a.Type == "deleted" {
-			return false
-		}
-		if !compareAtomValue(a.Value, cond.Operator, cond.Value) {
-			return false
+	orGroups := [][]Condition{}
+	var currentGroup []Condition
+
+	for i, cond := range conditions {
+		currentGroup = append(currentGroup, cond)
+		if i < len(conditions)-1 && strings.ToUpper(conditions[i].Logic) == "OR" {
+			orGroups = append(orGroups, currentGroup)
+			currentGroup = nil
 		}
 	}
-	return true
+	if len(currentGroup) > 0 {
+		orGroups = append(orGroups, currentGroup)
+	}
+
+	for _, group := range orGroups {
+		groupPass := true
+		for _, cond := range group {
+			a, ok := attrs[cond.Field]
+			if !ok || a.Type == "deleted" || !compareAtomValue(a.Value, cond.Operator, cond.Value) {
+				groupPass = false
+				break
+			}
+		}
+		if groupPass {
+			return true
+		}
+	}
+	return false
 }
 
 func compareAtomValue(atomVal interface{}, op string, condVal interface{}) bool {

@@ -49,7 +49,7 @@ func Run(db *DB, args []string) error {
 	case "update":
 		return cmdUpdate(db, args[1:])
 	case "delete":
-		return cmdDeleteCmd(db, args[1:])
+		return cmdDelete(db, args[1:])
 	case "types":
 		return cmdTypes(db)
 	case "set":
@@ -164,6 +164,13 @@ func cmdInsert(db *DB, args []string) error {
 		}
 	}
 
+	// Detect duplicate entity IDs (same natural key already exists)
+	if db.Store.Exists(entity, "name") || db.Store.Exists(entity, "id") ||
+		db.Store.Exists(entity, "email") || db.Store.Exists(entity, "title") ||
+		db.Store.Exists(entity, "__type") {
+		return fmt.Errorf("duplicate entity: %q already exists", entity)
+	}
+
 	// Store each field as an atom
 	for attr, val := range validated {
 		valType := inferType(val)
@@ -209,8 +216,8 @@ func cmdUpdate(db *DB, args []string) error {
 	return nil
 }
 
-// cmdDeleteCmd handles: DELETE type where condition
-func cmdDeleteCmd(db *DB, args []string) error {
+// cmdDelete handles: DELETE type where condition
+func cmdDelete(db *DB, args []string) error {
 	input := "DELETE " + strings.Join(args, " ")
 	parsed, err := query.Parse(input)
 	if err != nil {
@@ -511,11 +518,6 @@ func parseRawValue(raw, valueType string) (interface{}, error) {
 }
 
 func parseRawVal(raw string) interface{} {
-	// Try number
-	if f, err := strconv.ParseFloat(raw, 64); err == nil {
-		return f
-	}
-	// Try boolean
 	if raw == "true" {
 		return true
 	}
