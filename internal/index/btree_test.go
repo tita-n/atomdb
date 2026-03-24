@@ -213,3 +213,35 @@ func TestBTreeNumericRangeCorrectness(t *testing.T) {
 		t.Errorf("numeric range GT 8: got %d results, want 3: %v", len(results), results)
 	}
 }
+
+func TestBTreeNumericRangeWithZeroAndNegatives(t *testing.T) {
+	tree := New()
+	tree.Insert(encodeNumericKey(-100), []string{"e:1.score"})
+	tree.Insert(encodeNumericKey(0), []string{"e:2.score"})
+	tree.Insert(encodeNumericKey(0.1), []string{"e:3.score"})
+	tree.Insert(encodeNumericKey(999999.5), []string{"e:4.score"})
+
+	// >= 0 should return 0, 0.1, 999999.5
+	results := tree.RangeQuery(OpGte, encodeNumericKey(0.0))
+	if len(results) != 3 {
+		t.Errorf("numeric range GTE 0: got %d, want 3: %v", len(results), results)
+	}
+
+	// < 0 should return -100
+	results = tree.RangeQuery(OpLt, encodeNumericKey(0.0))
+	if len(results) != 1 {
+		t.Errorf("numeric range LT 0: got %d, want 1: %v", len(results), results)
+	}
+
+	// > 100 should return 999999.5
+	results = tree.RangeQuery(OpGt, encodeNumericKey(100.0))
+	if len(results) != 1 {
+		t.Errorf("numeric range GT 100: got %d, want 1: %v", len(results), results)
+	}
+
+	// <= 0 should return -100, 0
+	results = tree.RangeQuery(OpLte, encodeNumericKey(0.0))
+	if len(results) != 2 {
+		t.Errorf("numeric range LTE 0: got %d, want 2: %v", len(results), results)
+	}
+}

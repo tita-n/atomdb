@@ -279,12 +279,14 @@ func (s *AtomStore) QueryEntities(typeName string, conditions []Condition) []str
 		}
 
 		var keys []string
+		// Pass value as string — Search/RangeSearch normalize internally
+		valStr := fmt.Sprintf("%v", cond.Value)
 		switch cond.Operator {
 		case "==":
-			keys = s.idx.Search(cond.Field, index.NormalizeValue(cond.Value))
+			keys = s.idx.Search(cond.Field, valStr)
 		case ">", ">=", "<", "<=":
 			rangeOp := operatorToRangeOp(cond.Operator)
-			keys = s.idx.RangeSearch(cond.Field, rangeOp, index.NormalizeValue(cond.Value))
+			keys = s.idx.RangeSearch(cond.Field, rangeOp, valStr)
 		default:
 			continue
 		}
