@@ -295,93 +295,139 @@ func parseSelect(input string) (*ParsedInput, error) {
 }
 
 func parseShorthand(input string) (*ParsedInput, error) {
-	// "person where age > 25" → SELECT * FROM person WHERE age > 25
-	// "person.name where city == Lagos" → SELECT name FROM person WHERE city == "Lagos"
-	// Supports: "person order by name limit 10 where age > 25"
-
-	lower := strings.ToLower(input)
-
-	whereIdx := strings.Index(lower, " where ")
-	if whereIdx < 0 {
-		return &ParsedInput{
-			Command: "SELECT",
-			Query: &Query{
-				TypeName: strings.TrimSpace(input),
-			},
-		}, nil
-	}
-
-	beforeWhere := strings.TrimSpace(input[:whereIdx])
-	afterWhere := strings.TrimSpace(input[whereIdx+7:])
-
 	q := &Query{}
 
-	typeAndClauses := strings.TrimSpace(beforeWhere)
-	orderIdx := strings.Index(strings.ToLower(typeAndClauses), " order by ")
-	limitIdx := strings.Index(strings.ToLower(typeAndClauses), " limit ")
+	// First extract ORDER BY and LIMIT from the full input
+	input = strings.TrimSpace(extractOrderByLimit(input, q))
 
-	if orderIdx >= 0 && (limitIdx < 0 || orderIdx < limitIdx) {
-		typePart := strings.TrimSpace(typeAndClauses[:orderIdx])
-		rest := strings.TrimSpace(typeAndClauses[orderIdx+10:])
-		q.TypeName = extractTypeAndFields(typePart, q)
-		rest = parseOrderByAndLimit(rest, q)
-	} else if limitIdx >= 0 {
-		typePart := strings.TrimSpace(typeAndClauses[:limitIdx])
-		rest := strings.TrimSpace(typeAndClauses[limitIdx+7:])
-		q.TypeName = extractTypeAndFields(typePart, q)
-		if n, err := strconv.Atoi(strings.TrimSpace(strings.Fields(rest)[0])); err == nil {
-			q.Limit = n
-		}
+	// Now split on "where" (ORDER BY/LIMIT are already extracted)
+	lower := strings.ToLower(input)
+	whereIdx := strings.Index(lower, " where ")
+
+	var typeSelector, condPart string
+	if whereIdx < 0 {
+		typeSelector = strings.TrimSpace(input)
+		condPart = ""
 	} else {
-		q.TypeName = extractTypeAndFields(typeAndClauses, q)
+		typeSelector = strings.TrimSpace(input[:whereIdx])
+		condPart = strings.TrimSpace(input[whereIdx+7:])
 	}
 
-	conditions, err := parseWhere(afterWhere)
-	if err != nil {
-		return nil, err
-	}
-	q.Conditions = conditions
+	// Parse type name and field selection
+	q.TypeName = extractTypeAndFields(typeSelector, q)
 
-	// Also extract ORDER BY and LIMIT from afterWhere (after "where")
-	if q.OrderBy == nil {
-		afterWhereLower := strings.ToLower(afterWhere)
-		orderIdx := strings.Index(afterWhereLower, " order by ")
-		limitIdx := strings.Index(afterWhereLower, " limit ")
-
-		if orderIdx >= 0 && (limitIdx < 0 || orderIdx < limitIdx) {
-			beforeOrder := strings.TrimSpace(afterWhere[:orderIdx])
-			q.Conditions, _ = parseWhere(beforeOrder)
-			remaining := strings.TrimSpace(afterWhere[orderIdx+10:])
-			parts := strings.SplitN(remaining, " ", 2)
-			field := strings.TrimSpace(parts[0])
-			desc := false
-			rest := ""
-			if len(parts) > 1 {
-				rest = strings.TrimSpace(parts[1])
-				if strings.HasPrefix(strings.ToLower(rest), "desc") {
-					desc = true
-					rest = strings.TrimSpace(rest[4:])
-				}
-			}
-			q.OrderBy = &OrderBy{Field: field, Desc: desc}
-			if rest != "" {
-				restLower := strings.ToLower(rest)
-				li := strings.Index(restLower, "limit ")
-				if li >= 0 {
-					q.Limit, _ = strconv.Atoi(strings.TrimSpace(strings.Fields(strings.TrimSpace(rest[li+6:]))[0]))
-				}
-			}
-		} else if limitIdx >= 0 && q.Limit == 0 {
-			beforeLimit := strings.TrimSpace(afterWhere[:limitIdx])
-			q.Conditions, _ = parseWhere(beforeLimit)
-			q.Limit, _ = strconv.Atoi(strings.TrimSpace(strings.Fields(strings.TrimSpace(afterWhere[limitIdx+7:]))[0]))
+	// Parse conditions
+	if condPart != "" {
+		conditions, err := parseWhere(condPart)
+		if err != nil {
+			return nil, err
 		}
+		q.Conditions = conditions
 	}
 
 	return &ParsedInput{
 		Command: "SELECT",
 		Query:   q,
 	}, nil
+}
+
+// extractOrderByLimit extracts ORDER BY and LIMIT from an input string.
+// Returns the remaining part of the string after removing ORDER BY/LIMIT clauses.
+func extractOrderByLimit(input string, q *Query) string {
+	if q == nil {
+		q = &Query{}
+	}
+	input = strings.TrimSpace(input)
+	lower := strings.ToLower(input)
+
+	orderIdx := strings.Index(lower, "order by")
+	limitIdx := strings.Index(lower, "limit ")
+
+	if orderIdx >= 0 && (limitIdx < 0 || orderIdx < limitIdx) {
+		before := strings.TrimSpace(input[:orderIdx])
+		rest := strings.TrimSpace(input[orderIdx+8:])
+		parts := strings.SplitN(rest, " ", 2)
+		q.OrderBy = &OrderBy{Field: strings.TrimSpace(parts[0]), Desc: false}
+		remaining := ""
+		if len(parts) > 1 {
+			remaining = strings.TrimSpace(parts[1])
+			if strings.HasPrefix(strings.ToLower(remaining), "desc") {
+				q.OrderBy.Desc = true
+				remaining = strings.TrimSpace(remaining[4:])
+			} else if strings.HasPrefix(strings.ToLower(remaining), "asc") {
+				remaining = strings.TrimSpace(remaining[3:])
+			}
+		}
+		if remaining != "" {
+			li := strings.Index(strings.ToLower(remaining), "limit ")
+			if li >= 0 {
+				afterLimit := strings.TrimSpace(remaining[li+6:])
+				limitFields := strings.Fields(afterLimit)
+				if len(limitFields) > 0 {
+					if n, err := strconv.Atoi(limitFields[0]); err == nil {
+						q.Limit = n
+					}
+					if len(limitFields) > 1 {
+						remaining = strings.TrimSpace(strings.Join(limitFields[1:], " "))
+					} else {
+						remaining = ""
+					}
+				}
+			}
+		}
+		return strings.TrimSpace(before + " " + remaining)
+	} else if limitIdx >= 0 && q.Limit == 0 {
+		before := strings.TrimSpace(input[:limitIdx])
+		rest := strings.TrimSpace(input[limitIdx+6:])
+		if n, err := strconv.Atoi(strings.TrimSpace(strings.Fields(rest)[0])); err == nil {
+			q.Limit = n
+		}
+		return before
+	}
+	return input
+}
+
+func extractOrderLimit(input string, q *Query) (typeName string, remainder string) {
+	typeName = strings.TrimSpace(input)
+	lower := strings.ToLower(input)
+	orderIdx := strings.Index(lower, "order by")
+	limitIdx := strings.Index(lower, "limit ")
+	if orderIdx >= 0 && (limitIdx < 0 || orderIdx < limitIdx) {
+		typeName = strings.TrimSpace(input[:orderIdx])
+		remainder = strings.TrimSpace(input[orderIdx+9:])
+		parts := strings.SplitN(remainder, " ", 2)
+		field := strings.TrimSpace(parts[0])
+		desc := false
+		rest := ""
+		if len(parts) > 1 {
+			rest = strings.TrimSpace(parts[1])
+			lowerRest := strings.ToLower(rest)
+			if strings.HasPrefix(lowerRest, "desc") {
+				desc = true
+				rest = strings.TrimSpace(rest[4:])
+			} else if strings.HasPrefix(lowerRest, "asc") {
+				rest = strings.TrimSpace(rest[3:])
+			}
+		}
+		q.OrderBy = &OrderBy{Field: field, Desc: desc}
+		if rest != "" {
+			li := strings.Index(strings.ToLower(rest), "limit ")
+			if li >= 0 {
+				rest = strings.TrimSpace(rest[li+6:])
+				if n, err := strconv.Atoi(strings.TrimSpace(strings.Fields(rest)[0])); err == nil {
+					q.Limit = n
+				}
+				remainder = strings.TrimSpace(rest[:li])
+			}
+		}
+	} else if limitIdx >= 0 {
+		typeName = strings.TrimSpace(input[:limitIdx])
+		remainder = strings.TrimSpace(input[limitIdx+6:])
+		if n, err := strconv.Atoi(strings.TrimSpace(strings.Fields(remainder)[0])); err == nil {
+			q.Limit = n
+		}
+	}
+	return typeName, remainder
 }
 
 func extractTypeAndFields(beforeWhere string, q *Query) string {

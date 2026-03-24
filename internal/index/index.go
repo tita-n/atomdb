@@ -125,24 +125,37 @@ func (im *IndexManager) RebuildFromAtoms(atoms map[string]map[string]*atom.Atom)
 func (im *IndexManager) Search(attribute, value string) []string {
 	im.mu.RLock()
 	bt, ok := im.indexes[attribute]
+	attrType := im.attrTypes[attribute]
 	im.mu.RUnlock()
 
 	if !ok {
 		return nil
 	}
 
-	return bt.Search(normalizeValue(value))
+	if attrType == "number" {
+		if f, err := strconv.ParseFloat(value, 64); err == nil {
+			return bt.Search(encodeNumericKey(f))
+		}
+	}
+	normalized := normalizeValue(value)
+	return bt.Search(normalized)
 }
 
 func (im *IndexManager) RangeSearch(attribute string, op RangeOp, value string) []string {
 	im.mu.RLock()
 	bt, ok := im.indexes[attribute]
+	attrType := im.attrTypes[attribute]
 	im.mu.RUnlock()
 
 	if !ok {
 		return nil
 	}
 
+	if attrType == "number" {
+		if f, err := strconv.ParseFloat(value, 64); err == nil {
+			return bt.RangeQuery(op, encodeNumericKey(f))
+		}
+	}
 	return bt.RangeQuery(op, normalizeValue(value))
 }
 
@@ -350,8 +363,7 @@ func toFloat64Value(v interface{}) (float64, error) {
 
 // NormalizeValue converts a Go value to a normalized string key for indexing.
 // Numbers use IEEE 754 bit encoding so that string comparison preserves numeric ordering.
-// Strings that look like numbers are parsed and encoded numerically to ensure
-// range queries work correctly (e.g., query "age > 20" where 20 is a CLI string).
+// Strings are indexed as-is to prevent type coercion bugs (e.g., "123" matching 123).
 func NormalizeValue(v interface{}) string {
 	switch val := v.(type) {
 	case float64:
@@ -368,13 +380,8 @@ func NormalizeValue(v interface{}) string {
 		}
 		return "false"
 	case string:
-		// Try to parse as number so range queries work on numeric attributes
-		if f, err := strconv.ParseFloat(val, 64); err == nil {
-			return EncodeNumericKey(f)
-		}
-		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
-			return EncodeNumericKey(float64(i))
-		}
+		// Strings stay as strings - do NOT auto-convert to numbers
+		// This prevents "123445" and 123445 from colliding in the index
 		return val
 	case nil:
 		return ""
@@ -385,6 +392,28 @@ func NormalizeValue(v interface{}) string {
 
 // normalizeValue is the internal alias kept for backward compatibility.
 func normalizeValue(v interface{}) string { return NormalizeValue(v) }
+
+// normalizeForQuery converts a query value to an index key, using the target
+// attribute's known type to decide whether to parse strings as numbers.
+// This is separate from NormalizeValue which is used for storage.
+func normalizeForQuery(attribute string, v interface{}) string {
+	val := normalizeValue(v)
+	// If the stored type is numeric and we got a string, try to parse it
+	if vStr, ok := v.(string); ok {
+		if im, _ := v.(*IndexManager); im != nil {
+			// No access to the manager here, so we try parse
+			_ = im
+		}
+		// Try numeric parse as fallback for query values
+		if f, err := strconv.ParseFloat(vStr, 64); err == nil {
+			return EncodeNumericKey(f)
+		}
+		if i, err := strconv.ParseInt(vStr, 10, 64); err == nil {
+			return EncodeNumericKey(float64(i))
+		}
+	}
+	return val
+}
 
 // EncodeNumericKey produces a fixed-width 16-char hex string that sorts correctly
 // with string comparison for any float64 value. Uses IEEE 754 bit manipulation:

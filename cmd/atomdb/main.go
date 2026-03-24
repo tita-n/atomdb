@@ -77,14 +77,16 @@ func sanitizePath(p string) (string, error) {
 		return "", fmt.Errorf("invalid database path: contains null byte")
 	}
 
-	// Check for ".." in the ORIGINAL string before cleaning, since filepath.Clean
-	// resolves ".." on Windows before we can check for it
-	if strings.Contains(p, "..") {
-		return "", fmt.Errorf("invalid database path: must not contain '..'")
+	if filepath.IsAbs(p) {
+		cleaned := filepath.Clean(p)
+		if strings.Contains(cleaned, "..") {
+			return "", fmt.Errorf("invalid database path: must not contain '..'")
+		}
+		return cleaned, nil
 	}
 
-	if filepath.IsAbs(p) {
-		return "", fmt.Errorf("invalid database path: must not be absolute")
+	if strings.Contains(p, "..") {
+		return "", fmt.Errorf("invalid database path: must not contain '..'")
 	}
 
 	p = filepath.Clean(p)
