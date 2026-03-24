@@ -348,20 +348,20 @@ func toFloat64Value(v interface{}) (float64, error) {
 	}
 }
 
-// normalizeValue converts a Go value to a normalized string key for indexing.
+// NormalizeValue converts a Go value to a normalized string key for indexing.
 // Numbers use IEEE 754 bit encoding so that string comparison preserves numeric ordering.
 // Strings that look like numbers are parsed and encoded numerically to ensure
 // range queries work correctly (e.g., query "age > 20" where 20 is a CLI string).
-func normalizeValue(v interface{}) string {
+func NormalizeValue(v interface{}) string {
 	switch val := v.(type) {
 	case float64:
-		return encodeNumericKey(val)
+		return EncodeNumericKey(val)
 	case float32:
-		return encodeNumericKey(float64(val))
+		return EncodeNumericKey(float64(val))
 	case int:
-		return encodeNumericKey(float64(val))
+		return EncodeNumericKey(float64(val))
 	case int64:
-		return encodeNumericKey(float64(val))
+		return EncodeNumericKey(float64(val))
 	case bool:
 		if val {
 			return "true"
@@ -370,10 +370,10 @@ func normalizeValue(v interface{}) string {
 	case string:
 		// Try to parse as number so range queries work on numeric attributes
 		if f, err := strconv.ParseFloat(val, 64); err == nil {
-			return encodeNumericKey(f)
+			return EncodeNumericKey(f)
 		}
 		if i, err := strconv.ParseInt(val, 10, 64); err == nil {
-			return encodeNumericKey(float64(i))
+			return EncodeNumericKey(float64(i))
 		}
 		return val
 	case nil:
@@ -383,11 +383,14 @@ func normalizeValue(v interface{}) string {
 	}
 }
 
-// encodeNumericKey produces a fixed-width 16-char hex string that sorts correctly
+// normalizeValue is the internal alias kept for backward compatibility.
+func normalizeValue(v interface{}) string { return NormalizeValue(v) }
+
+// EncodeNumericKey produces a fixed-width 16-char hex string that sorts correctly
 // with string comparison for any float64 value. Uses IEEE 754 bit manipulation:
 // flip sign bit for positives, invert all bits for negatives.
 // Uses strconv.FormatUint instead of fmt.Sprintf for ~3x fewer allocations.
-func encodeNumericKey(v float64) string {
+func EncodeNumericKey(v float64) string {
 	bits := math.Float64bits(v)
 	if bits>>63 == 1 {
 		bits = ^bits
@@ -400,3 +403,6 @@ func encodeNumericKey(v float64) string {
 	}
 	return hex
 }
+
+// encodeNumericKey is the internal alias kept for backward compatibility.
+func encodeNumericKey(v float64) string { return EncodeNumericKey(v) }

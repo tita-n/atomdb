@@ -40,6 +40,7 @@ type AtomStore struct {
 	idx                  *index.IndexManager
 	constraints          *ConstraintManager
 	history              []atom.Atom
+	historyWriteIdx      int
 	file                 *os.File
 	dirty                bool
 	dirtyCount           int
@@ -258,6 +259,212 @@ func (s *AtomStore) HasIndex(attribute string) bool {
 	return s.idx.HasIndex(attribute)
 }
 
+// QueryEntities finds all entity IDs of a given type matching conditions.
+// Uses B-Tree indexes when available for the first condition, falls back to
+// entity-grouped scan otherwise. This is the primary query path for SELECT/UPDATE/DELETE.
+func (s *AtomStore) QueryEntities(typeName string, conditions []Condition) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	prefix := typeName + ":"
+
+	if len(conditions) == 0 {
+		return s.scanEntitiesByPrefix(prefix)
+	}
+
+	// Find the first condition whose field has an index — use it for fast lookup
+	for ci, cond := range conditions {
+		if !s.idx.HasIndex(cond.Field) {
+			continue
+		}
+
+		var keys []string
+		switch cond.Operator {
+		case "==":
+			keys = s.idx.Search(cond.Field, index.NormalizeValue(cond.Value))
+		case ">", ">=", "<", "<=":
+			rangeOp := operatorToRangeOp(cond.Operator)
+			keys = s.idx.RangeSearch(cond.Field, rangeOp, index.NormalizeValue(cond.Value))
+		default:
+			continue
+		}
+
+		if keys == nil || len(keys) == 0 {
+			return nil
+		}
+
+		// Build remaining conditions (everything except the indexed one)
+		var remaining []Condition
+		for i, c := range conditions {
+			if i != ci {
+				remaining = append(remaining, c)
+			}
+		}
+
+		return s.resolveEntityKeysFiltered(keys, prefix, remaining)
+	}
+
+	// No usable index — full scan fallback grouped by entity
+	return s.scanEntitiesWithConditions(prefix, conditions)
+}
+
+// scanEntitiesByPrefix returns all live entity IDs with the given prefix.
+func (s *AtomStore) scanEntitiesByPrefix(prefix string) []string {
+	var results []string
+	for entity, attrs := range s.atoms {
+		if !strings.HasPrefix(entity, prefix) {
+			continue
+		}
+		for _, a := range attrs {
+			if a.Type != "deleted" {
+				results = append(results, entity)
+				break
+			}
+		}
+	}
+	return results
+}
+
+// resolveEntityKeysFiltered converts B-Tree keys ("entity.attr") to unique entity IDs,
+// filtering by type prefix and applying remaining conditions.
+func (s *AtomStore) resolveEntityKeysFiltered(keys []string, prefix string, remaining []Condition) []string {
+	seen := make(map[string]struct{}, len(keys)/2)
+	var results []string
+
+	for _, k := range keys {
+		parts := splitEntityAttr(k)
+		if len(parts) != 2 {
+			continue
+		}
+		entity := parts[0]
+		if _, dup := seen[entity]; dup {
+			continue
+		}
+		if !strings.HasPrefix(entity, prefix) {
+			continue
+		}
+		seen[entity] = struct{}{}
+
+		if len(remaining) == 0 {
+			results = append(results, entity)
+			continue
+		}
+
+		attrs := s.atoms[entity]
+		if attrs == nil {
+			continue
+		}
+		if matchConditionsLocal(attrs, remaining) {
+			results = append(results, entity)
+		}
+	}
+	return results
+}
+
+// scanEntitiesWithConditions groups atoms by entity and filters by conditions.
+// Replaces the old pattern of scanning every atom then calling GetAll per entity.
+func (s *AtomStore) scanEntitiesWithConditions(prefix string, conditions []Condition) []string {
+	var results []string
+	for entity, attrs := range s.atoms {
+		if !strings.HasPrefix(entity, prefix) {
+			continue
+		}
+		hasLive := false
+		for _, a := range attrs {
+			if a.Type != "deleted" {
+				hasLive = true
+				break
+			}
+		}
+		if !hasLive {
+			continue
+		}
+		if matchConditionsLocal(attrs, conditions) {
+			results = append(results, entity)
+		}
+	}
+	return results
+}
+
+// matchConditionsLocal checks if entity attributes satisfy all conditions.
+func matchConditionsLocal(attrs map[string]*atom.Atom, conditions []Condition) bool {
+	for _, cond := range conditions {
+		a, ok := attrs[cond.Field]
+		if !ok || a.Type == "deleted" {
+			return false
+		}
+		if !compareAtomValueLocal(a.Value, cond.Operator, cond.Value) {
+			return false
+		}
+	}
+	return true
+}
+
+// compareAtomValueLocal compares atom values using the given operator.
+func compareAtomValueLocal(atomVal interface{}, op string, condVal interface{}) bool {
+	switch op {
+	case "==":
+		return fmt.Sprintf("%v", atomVal) == fmt.Sprintf("%v", condVal)
+	case "!=":
+		return fmt.Sprintf("%v", atomVal) != fmt.Sprintf("%v", condVal)
+	default:
+		af := toFloatLocal(atomVal)
+		bf := toFloatLocal(condVal)
+		switch op {
+		case ">":
+			return af > bf
+		case "<":
+			return af < bf
+		case ">=":
+			return af >= bf
+		case "<=":
+			return af <= bf
+		}
+	}
+	return false
+}
+
+func toFloatLocal(v interface{}) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case float32:
+		return float64(n)
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	default:
+		var f float64
+		if _, err := fmt.Sscanf(fmt.Sprintf("%v", v), "%f", &f); err == nil {
+			return f
+		}
+		return 0
+	}
+}
+
+// operatorToRangeOp converts a string operator to a RangeOp.
+func operatorToRangeOp(op string) index.RangeOp {
+	switch op {
+	case ">":
+		return index.OpGt
+	case ">=":
+		return index.OpGte
+	case "<":
+		return index.OpLt
+	case "<=":
+		return index.OpLte
+	}
+	return index.OpGt
+}
+
+// Condition represents a query condition, local to store to avoid circular import with query package.
+type Condition struct {
+	Field    string
+	Operator string
+	Value    interface{}
+}
+
 func (s *AtomStore) QueryIndexed(attribute, value string) []*atom.Atom {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -471,12 +678,17 @@ func (s *AtomStore) Stats() StoreStats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	histSize := len(s.history)
+	if s.historyWriteIdx > histSize {
+		histSize = maxHistorySize
+	}
+
 	return StoreStats{
 		EntityCount:    len(s.atoms),
 		AtomCount:      s.atomCount(),
 		IndexedAttrs:   s.idx.IndexedAttributes(),
 		IndexKeyCount:  s.idx.TotalKeys(),
-		HistorySize:    len(s.history),
+		HistorySize:    histSize,
 		LastPersistedV: s.lastPersistedVersion,
 	}
 }
@@ -504,11 +716,14 @@ func (s *AtomStore) atomCount() int {
 }
 
 func (s *AtomStore) appendHistory(a atom.Atom) {
-	s.history = append(s.history, a)
-	if len(s.history) > maxHistorySize {
-		keep := maxHistorySize / 2
-		s.history = s.history[len(s.history)-keep:]
+	if len(s.history) < maxHistorySize {
+		s.history = append(s.history, a)
+		return
 	}
+	// Ring buffer: overwrite oldest entry
+	idx := s.historyWriteIdx % maxHistorySize
+	s.history[idx] = a
+	s.historyWriteIdx++
 }
 
 func (s *AtomStore) maybeSync() error {

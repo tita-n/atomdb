@@ -236,3 +236,73 @@ func TestStoreHistoryPopulatedOnStartup(t *testing.T) {
 		t.Error("history should be populated after startup replay")
 	}
 }
+
+func TestStoreQueryEntitiesEquality(t *testing.T) {
+	s, _ := New(tempDB(t))
+	defer s.Close()
+
+	s.Set("person:1", "name", "Ayo", "string")
+	s.Set("person:1", "city", "Lagos", "string")
+	s.Set("person:2", "name", "Bob", "string")
+	s.Set("person:2", "city", "Lagos", "string")
+	s.Set("person:3", "name", "Chi", "string")
+	s.Set("person:3", "city", "Abuja", "string")
+
+	// Query with index on city
+	results := s.QueryEntities("person", []Condition{{Field: "city", Operator: "==", Value: "Lagos"}})
+	if len(results) != 2 {
+		t.Errorf("QueryEntities(city==Lagos) = %d results, want 2", len(results))
+	}
+}
+
+func TestStoreQueryEntitiesRange(t *testing.T) {
+	s, _ := New(tempDB(t))
+	defer s.Close()
+
+	s.Set("person:1", "age", 20.0, "number")
+	s.Set("person:1", "name", "Ayo", "string")
+	s.Set("person:2", "age", 30.0, "number")
+	s.Set("person:2", "name", "Bob", "string")
+	s.Set("person:3", "age", 40.0, "number")
+	s.Set("person:3", "name", "Chi", "string")
+
+	results := s.QueryEntities("person", []Condition{{Field: "age", Operator: ">", Value: 25.0}})
+	if len(results) != 2 {
+		t.Errorf("QueryEntities(age>25) = %d results, want 2", len(results))
+	}
+}
+
+func TestStoreQueryEntitiesMultipleConditions(t *testing.T) {
+	s, _ := New(tempDB(t))
+	defer s.Close()
+
+	s.Set("person:1", "city", "Lagos", "string")
+	s.Set("person:1", "age", 20.0, "number")
+	s.Set("person:2", "city", "Lagos", "string")
+	s.Set("person:2", "age", 30.0, "number")
+	s.Set("person:3", "city", "Abuja", "string")
+	s.Set("person:3", "age", 25.0, "number")
+
+	// Should use city index then filter by age
+	results := s.QueryEntities("person", []Condition{
+		{Field: "city", Operator: "==", Value: "Lagos"},
+		{Field: "age", Operator: ">", Value: 25.0},
+	})
+	if len(results) != 1 {
+		t.Errorf("QueryEntities(city==Lagos AND age>25) = %d results, want 1", len(results))
+	}
+}
+
+func TestStoreQueryEntitiesNoConditions(t *testing.T) {
+	s, _ := New(tempDB(t))
+	defer s.Close()
+
+	s.Set("person:1", "name", "Ayo", "string")
+	s.Set("person:2", "name", "Bob", "string")
+	s.Set("other:1", "name", "X", "string")
+
+	results := s.QueryEntities("person", nil)
+	if len(results) != 2 {
+		t.Errorf("QueryEntities(person, nil) = %d results, want 2", len(results))
+	}
+}

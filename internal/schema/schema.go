@@ -58,8 +58,9 @@ type FieldDef struct {
 
 // TypeDef defines a complete type (like a table schema).
 type TypeDef struct {
-	Name   string
-	Fields []FieldDef
+	Name     string
+	Fields   []FieldDef
+	fieldSet map[string]struct{} // cached set for O(1) field lookup
 }
 
 // Schema manages all type definitions.
@@ -159,9 +160,15 @@ func (s *Schema) DefineType(name string, fields []FieldDef) error {
 		}
 	}
 
+	fs := make(map[string]struct{}, len(fields))
+	for _, fd := range fields {
+		fs[fd.Name] = struct{}{}
+	}
+
 	s.types[name] = &TypeDef{
-		Name:   name,
-		Fields: fields,
+		Name:     name,
+		Fields:   fields,
+		fieldSet: fs,
 	}
 	return nil
 }
@@ -228,16 +235,9 @@ func (s *Schema) Validate(typeName string, fields map[string]interface{}) (map[s
 		result[fd.Name] = val
 	}
 
-	// Check for unknown fields
+	// Check for unknown fields — O(1) lookup per input field using cached set
 	for k := range fields {
-		found := false
-		for _, fd := range td.Fields {
-			if fd.Name == k {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if _, ok := td.fieldSet[k]; !ok {
 			return nil, fmt.Errorf("unknown field %q for type %q", k, typeName)
 		}
 	}
@@ -510,7 +510,11 @@ func (s *Schema) LoadFromFile(path string) error {
 				EnumVals: f.EnumVals,
 			})
 		}
-		s.types[d.Name] = &TypeDef{Name: d.Name, Fields: fields}
+		fs := make(map[string]struct{}, len(fields))
+		for _, fd := range fields {
+			fs[fd.Name] = struct{}{}
+		}
+		s.types[d.Name] = &TypeDef{Name: d.Name, Fields: fields, fieldSet: fs}
 	}
 	return nil
 }
