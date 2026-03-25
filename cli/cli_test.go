@@ -10,8 +10,8 @@ func TestParseRawVal(t *testing.T) {
 		expected interface{}
 	}{
 		{"hello", "hello"},
-		{"12345", "12345"},
-		{"3.14", "3.14"},
+		{"12345", float64(12345)},
+		{"3.14", 3.14},
 		{"true", true},
 		{"false", false},
 		{"", ""},

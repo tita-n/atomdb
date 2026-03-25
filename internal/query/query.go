@@ -79,6 +79,12 @@ func Parse(input string) (*ParsedInput, error) {
 	}
 
 	upper := strings.ToUpper(input)
+	lower := strings.ToLower(input)
+
+	// Route group by and aggregation queries to shorthand parser first
+	if strings.Contains(lower, "group by") || hasAggFunc(lower) {
+		return parseShorthand(input)
+	}
 
 	switch {
 	case strings.HasPrefix(upper, "TYPE "):
@@ -297,11 +303,87 @@ func parseSelect(input string) (*ParsedInput, error) {
 func parseShorthand(input string) (*ParsedInput, error) {
 	q := &Query{}
 
+	lower := strings.ToLower(input)
+
+	// Check for GROUP BY FIRST (before aggregation function check)
+	if gbIdx := strings.Index(lower, " group by "); gbIdx >= 0 {
+		fieldsPart := strings.TrimSpace(input[:gbIdx])
+		groupField := strings.TrimSpace(input[gbIdx+10:])
+
+		// Check if fieldsPart contains aggregation
+		subAggFn, _, subAggField := parseAggFunc(fieldsPart)
+		if subAggFn != "" {
+			q.Aggregate = subAggFn
+			q.AggField = subAggField
+			fieldsPart = removeAggFunc(fieldsPart)
+		}
+
+		fieldsPart = strings.TrimSpace(fieldsPart)
+		fieldsPart = strings.TrimSuffix(fieldsPart, ",")
+		if fieldsPart != "" {
+			for _, f := range strings.Split(fieldsPart, ",") {
+				f = strings.TrimSpace(f)
+				if f != "" && f != "*" {
+					q.Fields = append(q.Fields, f)
+				}
+			}
+		}
+
+		q.GroupBy = groupField
+		if dotIdx := strings.Index(groupField, "."); dotIdx >= 0 {
+			q.TypeName = groupField[:dotIdx]
+			q.GroupBy = groupField[dotIdx+1:]
+		} else {
+			for _, f := range q.Fields {
+				if dotIdx := strings.Index(f, "."); dotIdx >= 0 {
+					q.TypeName = f[:dotIdx]
+					break
+				}
+			}
+		}
+
+		return &ParsedInput{
+			Command: "SELECT",
+			Query:   q,
+		}, nil
+	}
+
+	// Check for aggregation functions: count(type), sum(type.field), etc.
+	aggFn, aggType, aggField := parseAggFunc(input)
+	if aggFn != "" {
+		q.Aggregate = aggFn
+		q.AggField = aggField
+		q.TypeName = aggType
+
+		// Remove the agg function from input, parse the rest
+		input = removeAggFunc(input)
+
+		// Extract ORDER BY and LIMIT
+		input = strings.TrimSpace(extractOrderByLimit(input, q))
+
+		// Parse WHERE if present
+		lower := strings.ToLower(input)
+		if strings.HasPrefix(lower, "where ") {
+			condPart := strings.TrimSpace(input[6:])
+			conditions, err := parseWhere(condPart)
+			if err != nil {
+				return nil, err
+			}
+			q.Conditions = conditions
+		}
+
+		return &ParsedInput{
+			Command: "SELECT",
+			Query:   q,
+		}, nil
+	}
+
+	// Standard shorthand: "type where condition"
 	// First extract ORDER BY and LIMIT from the full input
 	input = strings.TrimSpace(extractOrderByLimit(input, q))
 
 	// Now split on "where" (ORDER BY/LIMIT are already extracted)
-	lower := strings.ToLower(input)
+	lower = strings.ToLower(input)
 	whereIdx := strings.Index(lower, " where ")
 
 	var typeSelector, condPart string
@@ -329,6 +411,77 @@ func parseShorthand(input string) (*ParsedInput, error) {
 		Command: "SELECT",
 		Query:   q,
 	}, nil
+}
+
+// parseAggFunc detects aggregation functions like count(person), sum(expense.amount)
+// Returns (function, type, field).
+func parseAggFunc(input string) (fn string, typeName string, field string) {
+	aggFuncs := []string{"count", "sum", "avg", "min", "max"}
+	lower := strings.ToLower(input)
+
+	for _, af := range aggFuncs {
+		idx := strings.Index(lower, af+"(")
+		if idx < 0 {
+			continue
+		}
+		// Find closing paren
+		start := idx + len(af) + 1
+		end := strings.Index(input[start:], ")")
+		if end < 0 {
+			continue
+		}
+		inner := input[start : start+end]
+
+		// Parse "type.field" or "type" or "*"
+		if inner == "*" {
+			return af, "", ""
+		}
+		if dotIdx := strings.Index(inner, "."); dotIdx >= 0 {
+			return af, inner[:dotIdx], inner[dotIdx+1:]
+		}
+		return af, inner, ""
+	}
+	return "", "", ""
+}
+
+// removeAggFunc strips aggregation function from input string.
+func removeAggFunc(input string) string {
+	aggFuncs := []string{"count", "sum", "avg", "min", "max"}
+	lower := strings.ToLower(input)
+
+	for _, af := range aggFuncs {
+		idx := strings.Index(lower, af+"(")
+		if idx < 0 {
+			continue
+		}
+		end := strings.Index(input[idx:], ")")
+		if end < 0 {
+			continue
+		}
+		before := strings.TrimSpace(input[:idx])
+		after := strings.TrimSpace(input[idx+end+1:])
+		return strings.TrimSpace(before + " " + after)
+	}
+	return input
+}
+
+// hasAggFunc checks if the input contains an aggregation function.
+func hasAggFunc(lower string) bool {
+	for _, fn := range []string{"count(", "sum(", "avg(", "min(", "max("} {
+		if strings.Contains(lower, fn) {
+			return true
+		}
+	}
+	return false
+}
+
+// inferTypeFromField tries to guess the type name from a field reference.
+func inferTypeFromField(field string) string {
+	// If it looks like "type.field", return the type part
+	if dotIdx := strings.Index(field, "."); dotIdx >= 0 {
+		return field[:dotIdx]
+	}
+	return ""
 }
 
 // extractOrderByLimit extracts ORDER BY and LIMIT from an input string.

@@ -122,6 +122,38 @@ func (im *IndexManager) RebuildFromAtoms(atoms map[string]map[string]*atom.Atom)
 	}
 }
 
+// CreateIndex creates a new index for a field and indexes all existing data.
+// The fieldName is used as the index key (scoped globally, not by type).
+func (im *IndexManager) CreateIndex(typeName, fieldName string, atoms map[string]map[string]*atom.Atom) {
+	im.mu.Lock()
+	bt := New()
+	im.indexes[fieldName] = bt
+	im.mu.Unlock()
+
+	prefix := typeName + ":"
+	for entity, attrs := range atoms {
+		if !strings.HasPrefix(entity, prefix) {
+			continue
+		}
+		if a, ok := attrs[fieldName]; ok && a.Type != "deleted" {
+			key := normalizeValue(a.Value)
+			entityKey := entity + "." + fieldName
+			bt.Insert(key, []string{entityKey})
+			im.mu.Lock()
+			im.attrTypes[fieldName] = a.Type
+			im.mu.Unlock()
+		}
+	}
+}
+
+// DropIndex removes an index for a field.
+func (im *IndexManager) DropIndex(fieldName string) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	delete(im.indexes, fieldName)
+	delete(im.attrTypes, fieldName)
+}
+
 func (im *IndexManager) Search(attribute, value string) []string {
 	im.mu.RLock()
 	bt, ok := im.indexes[attribute]

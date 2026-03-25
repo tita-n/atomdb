@@ -652,6 +652,21 @@ func (s *AtomStore) RebuildIndexes() {
 	s.idx.RebuildFromAtoms(s.atoms)
 }
 
+// CreateIndex creates a B-Tree index for the given type field.
+// Indexes all existing data for that field.
+func (s *AtomStore) CreateIndex(typeName, fieldName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idx.CreateIndex(typeName, fieldName, s.atoms)
+}
+
+// DropIndex drops the B-Tree index for the given field.
+func (s *AtomStore) DropIndex(fieldName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idx.DropIndex(fieldName)
+}
+
 func (s *AtomStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

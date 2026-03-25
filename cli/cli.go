@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/tita-n/atomdb/internal/atom"
 	"github.com/tita-n/atomdb/internal/query"
@@ -19,10 +21,32 @@ type DB struct {
 	Schema         *schema.Schema
 	DataDir        string
 	SchemaEnforced bool
+	QueryStats     *QueryStats
+}
+
+// QueryStats tracks query execution metrics.
+type QueryStats struct {
+	mu          sync.Mutex
+	Total       int64
+	IndexHits   int64
+	FullScans   int64
+	TotalTimeMs float64
+}
+
+func (qs *QueryStats) Record(useIndex bool, durationMs float64) {
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+	qs.Total++
+	if useIndex {
+		qs.IndexHits++
+	} else {
+		qs.FullScans++
+	}
+	qs.TotalTimeMs += durationMs
 }
 
 func NewDB(s *store.AtomStore, sc *schema.Schema, dataDir string) *DB {
-	return &DB{Store: s, Schema: sc, DataDir: dataDir}
+	return &DB{Store: s, Schema: sc, DataDir: dataDir, QueryStats: &QueryStats{}}
 }
 
 // persistSchema saves the schema to a JSON file in the data directory.
@@ -39,6 +63,12 @@ func Run(db *DB, args []string) error {
 		return nil
 	}
 
+	// Shell may pass "create index on type (field)" as single arg.
+	// Split first arg on spaces if it contains a space.
+	if len(args) == 1 && strings.Contains(args[0], " ") {
+		args = strings.Fields(args[0])
+	}
+
 	cmd := strings.ToLower(args[0])
 
 	switch cmd {
@@ -52,6 +82,12 @@ func Run(db *DB, args []string) error {
 		return cmdDelete(db, args[1:])
 	case "types":
 		return cmdTypes(db)
+	case "create":
+		return cmdCreate(db, args[1:])
+	case "drop":
+		return cmdDrop(db, args[1:])
+	case "indexes":
+		return cmdIndexes(db)
 	case "set":
 		return cmdSet(db.Store, args[1:])
 	case "get":
@@ -61,40 +97,20 @@ func Run(db *DB, args []string) error {
 	case "query":
 		return cmdQuery(db.Store, args[1:])
 	case "explain":
-		return cmdExplain(db.Store, args[1:])
+		return cmdExplainNew(db, args[1:])
 	case "search":
 		return cmdSearch(db.Store, args[1:])
 	case "index":
 		return cmdIndex(db.Store, args[1:])
 	case "stats":
-		return cmdStats(db.Store)
+		return cmdStatsNew(db)
 	case "compact":
 		return cmdCompact(db.Store)
-	case "backup":
-		return cmdBackup(db.Store, args[1:])
-	case "restore":
-		return cmdRestore(db.Store, args[1:])
-	case "constraint":
-		return cmdConstraint(db, args[1:])
-	case "constraints":
-		return cmdConstraints(db, args[1:])
-	case "relation":
-		return cmdRelation(db, args[1:])
-	case "relations":
-		return cmdRelations(db, args[1:])
-	case "migrate":
-		return cmdMigrate(db, args[1:])
-	case "migrations":
-		return cmdMigrations(db)
-	case "join":
-		return cmdJoin(db, args[1:])
-	case "tx":
-		return cmdTransaction(db, args[1:])
 	case "help":
 		printHelp()
 		return nil
 	default:
-		// Try as shorthand query: "type where condition"
+		// Try as shorthand query: "type where condition" or aggregation
 		return tryShorthandQuery(db, args)
 	}
 }
@@ -275,7 +291,6 @@ func cmdTypes(db *DB) error {
 }
 
 // tryShorthandQuery tries to parse args as a shorthand query.
-// e.g., "person where age > 25" or "person.name where city == Lagos"
 func tryShorthandQuery(db *DB, args []string) error {
 	input := strings.Join(args, " ")
 	parsed, err := query.Parse(input)
@@ -285,39 +300,53 @@ func tryShorthandQuery(db *DB, args []string) error {
 		return fmt.Errorf("unknown command: %s", args[0])
 	}
 
-	return executeSelect(db, parsed.Query)
+	return executeQuery(db, parsed.Query)
 }
 
-// executeSelect runs a SELECT query and prints results.
-func executeSelect(db *DB, q *query.Query) error {
-	results := db.queryEntities(q.TypeName, q.Conditions)
+// executeQuery runs a query and prints results. Handles aggregations, GROUP BY, ORDER BY, LIMIT.
+func executeQuery(db *DB, q *query.Query) error {
+	start := time.Now()
 
-	if len(results) == 0 {
-		fmt.Println("No results found.")
-		return nil
-	}
+	// Execute query to get matching entities
+	entities := db.queryEntities(q.TypeName, q.Conditions)
+	useIndex := hasUsableIndex(db, q)
 
 	// Build result rows
 	var rows []map[string]interface{}
-	for _, entity := range results {
+	for _, entity := range entities {
 		attrs := db.Store.GetAll(entity)
 		row := make(map[string]interface{})
 		row["_entity"] = entity
 
-		if len(q.Fields) == 0 {
-			// Return all fields
+		shouldLoadAll := q.Aggregate != "" || q.GroupBy != "" || len(q.Fields) == 0
+		if shouldLoadAll {
+			// Aggregation/group by: need all fields for grouping and aggregation
 			for attr, a := range attrs {
 				row[attr] = a.Value
 			}
 		} else {
-			// Return specified fields
+			// Specific fields requested
 			for _, f := range q.Fields {
-				if a, ok := attrs[f]; ok {
-					row[f] = a.Value
+				attrName := f
+				if dotIdx := strings.Index(f, "."); dotIdx >= 0 {
+					attrName = f[dotIdx+1:]
+				}
+				if a, ok := attrs[attrName]; ok {
+					row[attrName] = a.Value
 				}
 			}
 		}
 		rows = append(rows, row)
+	}
+
+	// Handle GROUP BY aggregations
+	if q.GroupBy != "" {
+		return executeGroupBy(db, q, rows, useIndex, start)
+	}
+
+	// Handle simple aggregation (no GROUP BY)
+	if q.Aggregate != "" {
+		return executeAggregation(db, q, rows, useIndex, start)
 	}
 
 	// Sort
@@ -328,12 +357,93 @@ func executeSelect(db *DB, q *query.Query) error {
 		rows = rows[:q.Limit]
 	}
 
-	// Print
+	// Print results
+	printRows(rows, q.Fields)
+
+	// Track stats
+	elapsed := float64(time.Since(start).Microseconds()) / 1000.0
+	db.QueryStats.Record(useIndex, elapsed)
+
+	return nil
+}
+
+// hasUsableIndex checks if the query can use a B-Tree index.
+func hasUsableIndex(db *DB, q *query.Query) bool {
+	for _, cond := range q.Conditions {
+		if db.Store.HasIndex(cond.Field) {
+			return true
+		}
+	}
+	return false
+}
+
+// executeAggregation runs a simple aggregation and prints the result.
+func executeAggregation(db *DB, q *query.Query, rows []map[string]interface{}, useIndex bool, start time.Time) error {
+	result, err := query.Aggregate(rows, q.Aggregate, q.AggField)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s = %v\n", formatAggLabel(q.Aggregate, q.AggField, q.TypeName), result)
+
+	elapsed := float64(time.Since(start).Microseconds()) / 1000.0
+	db.QueryStats.Record(useIndex, elapsed)
+	return nil
+}
+
+// executeGroupBy runs GROUP BY with aggregation.
+func executeGroupBy(db *DB, q *query.Query, rows []map[string]interface{}, useIndex bool, start time.Time) error {
+	if len(rows) == 0 {
+		fmt.Println("No results to group.")
+		return nil
+	}
+
+	groups := query.GroupByResults(rows, q.GroupBy)
+
+	// Sort group keys
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		groupRows := groups[key]
+		if q.Aggregate != "" {
+			aggResult, err := query.Aggregate(groupRows, q.Aggregate, q.AggField)
+			if err != nil {
+				fmt.Printf("%s = %v (0 rows)\n", key, 0)
+			} else {
+				fmt.Printf("%s = %v (%d rows)\n", key, aggResult, len(groupRows))
+			}
+		} else {
+			fmt.Printf("%s (%d rows)\n", key, len(groupRows))
+		}
+	}
+
+	elapsed := float64(time.Since(start).Microseconds()) / 1000.0
+	db.QueryStats.Record(useIndex, elapsed)
+	return nil
+}
+
+// formatAggLabel creates a readable label for aggregation results.
+func formatAggLabel(fn, field, typeName string) string {
+	if field == "" {
+		return fmt.Sprintf("%s(%s)", fn, typeName)
+	}
+	return fmt.Sprintf("%s(%s.%s)", fn, typeName, field)
+}
+
+// printRows outputs query results in a readable format.
+func printRows(rows []map[string]interface{}, fields []string) {
+	if len(rows) == 0 {
+		fmt.Println("No results found.")
+		return
+	}
+
 	for _, row := range rows {
-		// Collect fields (skip _entity for display unless no specific fields)
 		var parts []string
-		if len(q.Fields) == 0 {
-			// Show entity + all fields
+		if len(fields) == 0 {
 			keys := make([]string, 0, len(row))
 			for k := range row {
 				if k != "_entity" {
@@ -346,8 +456,7 @@ func executeSelect(db *DB, q *query.Query) error {
 			}
 			fmt.Printf("%s: %s\n", row["_entity"], strings.Join(parts, " "))
 		} else {
-			// Show specified fields
-			for _, f := range q.Fields {
+			for _, f := range fields {
 				if v, ok := row[f]; ok {
 					parts = append(parts, fmt.Sprintf("%s=%v", f, v))
 				}
@@ -355,9 +464,7 @@ func executeSelect(db *DB, q *query.Query) error {
 			fmt.Printf("%s.%s\n", row["_entity"], strings.Join(parts, " "))
 		}
 	}
-
 	fmt.Printf("(%d results)\n", len(rows))
-	return nil
 }
 
 // queryEntities finds all entities of a type matching conditions.
@@ -447,17 +554,71 @@ func cmdQuery(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-func cmdExplain(s *store.AtomStore, args []string) error {
-	if len(args) < 3 {
-		return fmt.Errorf("usage: explain <attribute> <op> <value>")
+func cmdExplainNew(db *DB, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: explain <query>")
 	}
-	plan := s.QueryExplain(args[0], args[1], args[2])
-	if plan.UseIndex {
-		fmt.Printf("Index scan: %s (%s)\nEstimated rows: %d\n", plan.Attribute, plan.ScanType, plan.EstimatedRows)
-	} else {
-		fmt.Printf("Full scan\nEstimated rows: %d\nRecommend: CREATE INDEX ON (%s)\n", plan.EstimatedRows, plan.Attribute)
+
+	input := strings.Join(args, " ")
+	parsed, err := query.Parse(input)
+	if err != nil || parsed.Command != "SELECT" {
+		// Fall back to raw explain: explain attr op value
+		if len(args) >= 3 {
+			plan := db.Store.QueryExplain(args[0], args[1], args[2])
+			printPlan(plan)
+			return nil
+		}
+		return fmt.Errorf("usage: explain <type> where <condition>")
 	}
+
+	q := parsed.Query
+	fmt.Printf("Query: %s\n", input)
+	fmt.Println()
+
+	// Show condition plans
+	for _, cond := range q.Conditions {
+		plan := db.Store.QueryExplain(cond.Field, cond.Operator, fmt.Sprintf("%v", cond.Value))
+		printPlan(plan)
+	}
+
+	if len(q.Conditions) == 0 {
+		fmt.Printf("Full scan: %s (no filter)\n", q.TypeName)
+	}
+
+	if q.OrderBy != nil {
+		fmt.Printf("Sort: %s (", q.OrderBy.Field)
+		if q.OrderBy.Desc {
+			fmt.Print("desc")
+		} else {
+			fmt.Print("asc")
+		}
+		fmt.Println(")")
+	}
+
+	if q.Limit > 0 {
+		fmt.Printf("Limit: %d\n", q.Limit)
+	}
+
+	if q.Aggregate != "" {
+		fmt.Printf("Aggregate: %s(%s)\n", q.Aggregate, q.AggField)
+	}
+
 	return nil
+}
+
+func printPlan(plan store.QueryPlan) {
+	if plan.UseIndex {
+		cost := "very low"
+		if plan.ScanType == "range" {
+			cost = "low"
+		}
+		fmt.Printf("Index scan: %s (%s) - cost: %s\n", plan.Attribute, plan.ScanType, cost)
+		fmt.Printf("Estimated rows: %d\n", plan.EstimatedRows)
+	} else {
+		fmt.Printf("Full scan: no index on %s - cost: high\n", plan.Attribute)
+		fmt.Printf("Estimated rows: %d\n", plan.EstimatedRows)
+		fmt.Printf("Recommend: CREATE INDEX ON %s (%s)\n", plan.Attribute, plan.Attribute)
+	}
 }
 
 func cmdSearch(s *store.AtomStore, args []string) error {
@@ -488,11 +649,34 @@ func cmdIndex(s *store.AtomStore, args []string) error {
 	return nil
 }
 
-func cmdStats(s *store.AtomStore) error {
-	stats := s.Stats()
-	fmt.Printf("Entities: %d\nAtoms: %d\nIndexed: %d\nIndexes: %s\n",
-		stats.EntityCount, stats.AtomCount, len(stats.IndexedAttrs),
-		strings.Join(stats.IndexedAttrs, ", "))
+func cmdStatsNew(db *DB) error {
+	stats := db.Store.Stats()
+	qs := db.QueryStats
+	qs.mu.Lock()
+	total := qs.Total
+	indexHits := qs.IndexHits
+	fullScans := qs.FullScans
+	avgTime := 0.0
+	if total > 0 {
+		avgTime = qs.TotalTimeMs / float64(total)
+	}
+	qs.mu.Unlock()
+
+	fmt.Printf("Storage:\n")
+	fmt.Printf("  Entities: %d\n", stats.EntityCount)
+	fmt.Printf("  Atoms: %d\n", stats.AtomCount)
+	fmt.Printf("  Indexes: %s\n", strings.Join(stats.IndexedAttrs, ", "))
+	fmt.Printf("  Index keys: %d\n", stats.IndexKeyCount)
+	fmt.Println()
+	fmt.Printf("Query stats:\n")
+	fmt.Printf("  Queries executed: %d\n", total)
+	if total > 0 {
+		indexPct := float64(indexHits) / float64(total) * 100
+		scanPct := float64(fullScans) / float64(total) * 100
+		fmt.Printf("  Index hits: %d (%.0f%%)\n", indexHits, indexPct)
+		fmt.Printf("  Full scans: %d (%.0f%%)\n", fullScans, scanPct)
+		fmt.Printf("  Average query time: %.2fms\n", avgTime)
+	}
 	return nil
 }
 
@@ -501,6 +685,79 @@ func cmdCompact(s *store.AtomStore) error {
 		return err
 	}
 	fmt.Println("Compaction complete.")
+	return nil
+}
+
+// cmdCreate handles: CREATE INDEX ON type (field)
+func cmdCreate(db *DB, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: create index on <type> (<field>)")
+	}
+
+	input := strings.ToUpper(strings.Join(args, " "))
+	if !strings.Contains(input, "INDEX") {
+		return fmt.Errorf("usage: create index on <type> (<field>)")
+	}
+
+	// Parse "index on type (field)" or "index on type(field)"
+	rest := strings.TrimSpace(strings.Join(args, " "))
+	rest = strings.TrimPrefix(strings.ToLower(rest), "index ")
+	rest = strings.TrimPrefix(rest, "on ")
+	rest = strings.TrimSpace(rest)
+
+	// Extract type and field
+	parenIdx := strings.Index(rest, "(")
+	if parenIdx < 0 {
+		// Try "index on type field"
+		parts := strings.Fields(rest)
+		if len(parts) < 2 {
+			return fmt.Errorf("usage: create index on <type> (<field>)")
+		}
+		typeName := parts[0]
+		fieldName := parts[1]
+		db.Store.CreateIndex(typeName, fieldName)
+		fmt.Printf("Index created: %s.%s\n", typeName, fieldName)
+		return nil
+	}
+
+	typeName := strings.TrimSpace(rest[:parenIdx])
+	fieldPart := rest[parenIdx+1:]
+	fieldPart = strings.TrimSuffix(fieldPart, ")")
+	fieldName := strings.TrimSpace(fieldPart)
+
+	db.Store.CreateIndex(typeName, fieldName)
+	fmt.Printf("Index created: %s.%s\n", typeName, fieldName)
+	return nil
+}
+
+// cmdDrop handles: DROP INDEX name or DROP INDEX type (field)
+func cmdDrop(db *DB, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: drop index <field>")
+	}
+
+	input := strings.Join(args, " ")
+	// Strip "index" prefix if present
+	input = strings.TrimPrefix(strings.ToLower(input), "index ")
+	input = strings.TrimSpace(input)
+
+	db.Store.DropIndex(input)
+	fmt.Printf("Index dropped: %s\n", input)
+	return nil
+}
+
+// cmdIndexes lists all indexes.
+func cmdIndexes(db *DB) error {
+	stats := db.Store.Stats()
+	if len(stats.IndexedAttrs) == 0 {
+		fmt.Println("No indexes. Use: create index on <type> (<field>)")
+		return nil
+	}
+	fmt.Println("Indexes:")
+	for _, attr := range stats.IndexedAttrs {
+		fmt.Printf("  %s\n", attr)
+	}
+	fmt.Printf("(%d indexes, %d keys total)\n", len(stats.IndexedAttrs), stats.IndexKeyCount)
 	return nil
 }
 
@@ -523,6 +780,13 @@ func parseRawVal(raw string) interface{} {
 	}
 	if raw == "false" {
 		return false
+	}
+	if raw == "nil" || raw == "null" {
+		return nil
+	}
+	// Try number
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		return f
 	}
 	return raw
 }
@@ -615,38 +879,35 @@ func printHelp() {
 	fmt.Println("  person where age > 25                       Filter by field")
 	fmt.Println("  person.name where city == Lagos             Select specific fields")
 	fmt.Println("  person order by name limit 10               Sort and limit")
-	fmt.Println()
-	fmt.Println("Transactions:")
-	fmt.Println("  tx begin|commit|rollback                    Transaction control")
-	fmt.Println()
-	fmt.Println("Constraints:")
-	fmt.Println("  constraint add type field unique|notnull    Add constraint")
-	fmt.Println("  constraints type                            List constraints")
-	fmt.Println()
-	fmt.Println("Relations:")
-	fmt.Println("  relation add from.field to.type cardinality  Add relation")
-	fmt.Println("  relations type                               List relations")
-	fmt.Println()
-	fmt.Println("Migrations:")
-	fmt.Println("  migrate add type field type                  Add field migration")
-	fmt.Println("  migrate remove type field                    Remove field migration")
-	fmt.Println("  migrations                                   List migrations")
-	fmt.Println()
-	fmt.Println("Backup:")
-	fmt.Println("  backup path                                  Create backup")
-	fmt.Println("  restore path                                 Restore from backup")
-	fmt.Println()
-	fmt.Println("Joins:")
-	fmt.Println("  join left.field right.type right.field       Join types")
+	fmt.Println("  person where age > 25 and city == Lagos     Compound condition")
 	fmt.Println()
 	fmt.Println("Aggregations:")
-	fmt.Println("  type where cond aggregate count|sum|avg|...")
+	fmt.Println("  count(person) where age > 25                Count records")
+	fmt.Println("  sum(expense.amount) where category == food  Sum field values")
+	fmt.Println("  avg(person.age) where city == Lagos         Average")
+	fmt.Println("  min(task.priority)                          Minimum value")
+	fmt.Println("  max(expense.amount)                         Maximum value")
+	fmt.Println()
+	fmt.Println("Group by:")
+	fmt.Println("  city, count(*) group by city                Group and count")
+	fmt.Println("  category, sum(amount) group by category     Group and sum")
+	fmt.Println()
+	fmt.Println("Indexes:")
+	fmt.Println("  create index on person (age)                Create index")
+	fmt.Println("  indexes                                     List indexes")
+	fmt.Println("  drop index age                              Drop index")
+	fmt.Println()
+	fmt.Println("Explain:")
+	fmt.Println("  explain person where age > 25               Show query plan")
+	fmt.Println()
+	fmt.Println("Stats:")
+	fmt.Println("  stats                                       Show stats")
+	fmt.Println("  compact                                     Compact data file")
 	fmt.Println()
 	fmt.Println("Operators: ==, !=, >, <, >=, <=")
 	fmt.Println("Types: string, number, boolean, ref")
 	fmt.Println()
-	fmt.Println("Raw commands: set, get, getall, query, explain, search, index, stats, compact")
-	fmt.Println("             backup, restore, constraint, relation, migrate, join, tx")
+	fmt.Println("Raw: set, get, getall, query, search, index")
 }
 
 // cmdBackup creates a point-in-time backup.
