@@ -132,13 +132,14 @@ func (im *IndexManager) Search(attribute, value string) []string {
 		return nil
 	}
 
+	// If field stores numbers, try to parse query value as number for lookup
 	if attrType == "number" {
 		if f, err := strconv.ParseFloat(value, 64); err == nil {
 			return bt.Search(encodeNumericKey(f))
 		}
 	}
-	normalized := normalizeValue(value)
-	return bt.Search(normalized)
+
+	return bt.Search(normalizeValue(value))
 }
 
 func (im *IndexManager) RangeSearch(attribute string, op RangeOp, value string) []string {
@@ -151,12 +152,73 @@ func (im *IndexManager) RangeSearch(attribute string, op RangeOp, value string) 
 		return nil
 	}
 
+	// If field stores numbers, try to parse query value as number for lookup
 	if attrType == "number" {
 		if f, err := strconv.ParseFloat(value, 64); err == nil {
 			return bt.RangeQuery(op, encodeNumericKey(f))
 		}
 	}
+
 	return bt.RangeQuery(op, normalizeValue(value))
+}
+
+// SearchByValue searches for exact matches using the value's native type.
+// If the value is a string that looks like a number, tries numeric encoding first,
+// then falls back to string encoding. This handles CLI string queries against numeric fields.
+func (im *IndexManager) SearchByValue(attribute string, value interface{}) []string {
+	im.mu.RLock()
+	bt, ok := im.indexes[attribute]
+	im.mu.RUnlock()
+
+	if !ok {
+		return nil
+	}
+
+	key := normalizeValue(value)
+
+	// If value is a string that looks like a number, try numeric key first
+	if vStr, ok := value.(string); ok {
+		if f, err := strconv.ParseFloat(vStr, 64); err == nil {
+			numKey := encodeNumericKey(f)
+			if numKey != key {
+				numResults := bt.Search(numKey)
+				if len(numResults) > 0 {
+					return numResults
+				}
+			}
+		}
+	}
+
+	return bt.Search(key)
+}
+
+// RangeSearchByValue performs a range query using the value's native type.
+// If the value is a string that looks like a number, tries numeric encoding first.
+func (im *IndexManager) RangeSearchByValue(attribute string, op RangeOp, value interface{}) []string {
+	im.mu.RLock()
+	bt, ok := im.indexes[attribute]
+	im.mu.RUnlock()
+
+	if !ok {
+		return nil
+	}
+
+	key := normalizeValue(value)
+
+	// If value is a string that looks like a number, try numeric range first
+	if vStr, ok := value.(string); ok {
+		if f, err := strconv.ParseFloat(vStr, 64); err == nil {
+			numKey := encodeNumericKey(f)
+			if numKey != key {
+				numResults := bt.RangeQuery(op, numKey)
+				if len(numResults) > 0 {
+					return numResults
+				}
+			}
+		}
+	}
+
+	return bt.RangeQuery(op, key)
 }
 
 func (im *IndexManager) HasIndex(attribute string) bool {
@@ -380,8 +442,6 @@ func NormalizeValue(v interface{}) string {
 		}
 		return "false"
 	case string:
-		// Strings stay as strings - do NOT auto-convert to numbers
-		// This prevents "123445" and 123445 from colliding in the index
 		return val
 	case nil:
 		return ""
@@ -390,28 +450,29 @@ func NormalizeValue(v interface{}) string {
 	}
 }
 
-// normalizeValue is the internal alias kept for backward compatibility.
 func normalizeValue(v interface{}) string { return NormalizeValue(v) }
 
-// normalizeForQuery converts a query value to an index key, using the target
-// attribute's known type to decide whether to parse strings as numbers.
-// This is separate from NormalizeValue which is used for storage.
-func normalizeForQuery(attribute string, v interface{}) string {
+// normalizeQueryValue converts a query value to an index key.
+// If the query value is a string but the target attribute stores numbers,
+// it tries to parse the string as a number so CLI queries like `age > "20"` work.
+func (im *IndexManager) normalizeQueryValue(attribute string, v interface{}) string {
 	val := normalizeValue(v)
-	// If the stored type is numeric and we got a string, try to parse it
+
 	if vStr, ok := v.(string); ok {
-		if im, _ := v.(*IndexManager); im != nil {
-			// No access to the manager here, so we try parse
-			_ = im
-		}
-		// Try numeric parse as fallback for query values
-		if f, err := strconv.ParseFloat(vStr, 64); err == nil {
-			return EncodeNumericKey(f)
-		}
-		if i, err := strconv.ParseInt(vStr, 10, 64); err == nil {
-			return EncodeNumericKey(float64(i))
+		im.mu.RLock()
+		storedType := im.attrTypes[attribute]
+		im.mu.RUnlock()
+
+		if storedType == "number" {
+			if f, err := strconv.ParseFloat(vStr, 64); err == nil {
+				return EncodeNumericKey(f)
+			}
+			if i, err := strconv.ParseInt(vStr, 10, 64); err == nil {
+				return EncodeNumericKey(float64(i))
+			}
 		}
 	}
+
 	return val
 }
 

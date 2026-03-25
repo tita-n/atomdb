@@ -279,14 +279,12 @@ func (s *AtomStore) QueryEntities(typeName string, conditions []Condition) []str
 		}
 
 		var keys []string
-		// Pass value as string — Search/RangeSearch normalize internally
-		valStr := fmt.Sprintf("%v", cond.Value)
 		switch cond.Operator {
 		case "==":
-			keys = s.idx.Search(cond.Field, valStr)
+			keys = s.idx.SearchByValue(cond.Field, cond.Value)
 		case ">", ">=", "<", "<=":
 			rangeOp := operatorToRangeOp(cond.Operator)
-			keys = s.idx.RangeSearch(cond.Field, rangeOp, valStr)
+			keys = s.idx.RangeSearchByValue(cond.Field, rangeOp, cond.Value)
 		default:
 			continue
 		}
@@ -471,7 +469,7 @@ func (s *AtomStore) QueryIndexed(attribute, value string) []*atom.Atom {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	keys := s.idx.Search(attribute, value)
+	keys := s.idx.SearchByValue(attribute, value)
 	if keys == nil {
 		return nil
 	}
@@ -483,7 +481,7 @@ func (s *AtomStore) QueryRange(attribute string, op index.RangeOp, value string)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	keys := s.idx.RangeSearch(attribute, op, value)
+	keys := s.idx.RangeSearchByValue(attribute, op, value)
 	if keys == nil {
 		return nil
 	}

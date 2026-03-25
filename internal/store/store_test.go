@@ -141,11 +141,13 @@ func TestStoreQueryRange(t *testing.T) {
 	s.Set("user:3", "age", 100.0, "number")
 
 	results := s.QueryRange("age", index.OpGt, "20")
+	t.Logf("QueryRange(age, GT, '20'): %d results: %v", len(results), results)
 	if len(results) != 2 {
 		t.Errorf("QueryRange(age, GT, 20) = %d results, want 2", len(results))
 	}
 
 	results = s.QueryRange("age", index.OpLt, "30")
+	t.Logf("QueryRange(age, LT, '30'): %d results: %v", len(results), results)
 	if len(results) != 2 {
 		t.Errorf("QueryRange(age, LT, 30) = %d results, want 2", len(results))
 	}
