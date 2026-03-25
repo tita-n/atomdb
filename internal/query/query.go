@@ -875,24 +875,71 @@ func MatchConditions(attrs map[string]*atom.Atom, conditions []Condition) bool {
 	return false
 }
 
-func compareAtomValue(atomVal interface{}, op string, condVal interface{}) bool {
-	// Try numeric comparison
-	af := toFloat(atomVal)
-	bf := toFloat(condVal)
+// sameTypeKind returns a category for type-safe comparison.
+// Returns "nil", "bool", "number", or "string".
+func sameTypeKind(a, b interface{}) string {
+	ka := valueKind(a)
+	kb := valueKind(b)
+	if ka == kb {
+		return ka
+	}
+	return ""
+}
 
+func valueKind(v interface{}) string {
+	if v == nil {
+		return "nil"
+	}
+	switch v.(type) {
+	case bool:
+		return "bool"
+	case float64, float32, int, int64:
+		return "number"
+	default:
+		return "string"
+	}
+}
+
+func compareAtomValue(atomVal interface{}, op string, condVal interface{}) bool {
 	switch op {
 	case "==":
+		// Type-safe equality: types must match
+		if sameTypeKind(atomVal, condVal) == "" {
+			return false
+		}
+		if atomVal == nil && condVal == nil {
+			return true
+		}
+		if atomVal == nil || condVal == nil {
+			return false
+		}
 		return fmt.Sprintf("%v", atomVal) == fmt.Sprintf("%v", condVal)
 	case "!=":
+		// Type-safe inequality
+		if sameTypeKind(atomVal, condVal) == "" {
+			return true
+		}
+		if atomVal == nil && condVal == nil {
+			return false
+		}
+		if atomVal == nil || condVal == nil {
+			return true
+		}
 		return fmt.Sprintf("%v", atomVal) != fmt.Sprintf("%v", condVal)
-	case ">":
-		return af > bf
-	case "<":
-		return af < bf
-	case ">=":
-		return af >= bf
-	case "<=":
-		return af <= bf
+	default:
+		// Numeric comparison for >, <, >=, <=
+		af := toFloat(atomVal)
+		bf := toFloat(condVal)
+		switch op {
+		case ">":
+			return af > bf
+		case "<":
+			return af < bf
+		case ">=":
+			return af >= bf
+		case "<=":
+			return af <= bf
+		}
 	}
 	return false
 }
@@ -916,6 +963,7 @@ func toFloat(v interface{}) float64 {
 }
 
 // SortResults sorts query results by a field.
+// Nil values are always sorted to the end regardless of sort direction.
 func SortResults(results []map[string]interface{}, orderBy *OrderBy) {
 	if orderBy == nil {
 		return
@@ -923,9 +971,18 @@ func SortResults(results []map[string]interface{}, orderBy *OrderBy) {
 	sort.Slice(results, func(i, j int) bool {
 		vi := results[i][orderBy.Field]
 		vj := results[j][orderBy.Field]
-		if vi == nil || vj == nil {
+
+		// Nil values always go to the end
+		if vi == nil && vj == nil {
 			return false
 		}
+		if vi == nil {
+			return false
+		}
+		if vj == nil {
+			return true
+		}
+
 		fi := toFloat(vi)
 		fj := toFloat(vj)
 		if orderBy.Desc {
@@ -935,6 +992,9 @@ func SortResults(results []map[string]interface{}, orderBy *OrderBy) {
 	})
 }
 
+// NULLGroupKey is the group key for rows where the GROUP BY field is nil.
+const NULLGroupKey = "\x00__NULL__\x00"
+
 // Aggregate computes an aggregate function over result rows.
 func Aggregate(rows []map[string]interface{}, fn string, field string) (interface{}, error) {
 	if len(rows) == 0 {
@@ -942,7 +1002,7 @@ func Aggregate(rows []map[string]interface{}, fn string, field string) (interfac
 		case "count":
 			return 0, nil
 		default:
-			return nil, fmt.Errorf("no rows to aggregate")
+			return nil, nil
 		}
 	}
 
@@ -1013,10 +1073,17 @@ func Aggregate(rows []map[string]interface{}, fn string, field string) (interfac
 }
 
 // GroupByResults groups rows by a field value.
+// Rows with a nil group field are grouped under NULLGroupKey.
 func GroupByResults(rows []map[string]interface{}, groupField string) map[string][]map[string]interface{} {
 	groups := make(map[string][]map[string]interface{})
 	for _, row := range rows {
-		key := fmt.Sprintf("%v", row[groupField])
+		val, exists := row[groupField]
+		var key string
+		if !exists || val == nil {
+			key = NULLGroupKey
+		} else {
+			key = fmt.Sprintf("%v", val)
+		}
 		groups[key] = append(groups[key], row)
 	}
 	return groups

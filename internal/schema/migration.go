@@ -41,6 +41,11 @@ func NewMigrationLog(path string) *MigrationLog {
 	}
 }
 
+// SetPath updates the file path for the migration log.
+func (ml *MigrationLog) SetPath(path string) {
+	ml.path = path
+}
+
 // Load reads the migration log from disk.
 func (ml *MigrationLog) Load() error {
 	data, err := os.ReadFile(ml.path)

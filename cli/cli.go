@@ -46,6 +46,7 @@ func (qs *QueryStats) Record(useIndex bool, durationMs float64) {
 }
 
 func NewDB(s *store.AtomStore, sc *schema.Schema, dataDir string) *DB {
+	sc.Migrations().SetPath(dataDir + "/schema.json")
 	return &DB{Store: s, Schema: sc, DataDir: dataDir, QueryStats: &QueryStats{}}
 }
 
@@ -168,6 +169,13 @@ func cmdInsert(db *DB, args []string) error {
 		return fmt.Errorf("validation failed: %w", err)
 	}
 
+	// Validate ref fields point to existing entities
+	if err := db.Schema.ValidateRefs(typeName, validated, func(entityID string) bool {
+		return db.Store.Exists(entityID, "__type") || db.Store.Exists(entityID, "name") || db.Store.Exists(entityID, "id")
+	}); err != nil {
+		return fmt.Errorf("ref validation failed: %w", err)
+	}
+
 	// Generate entity ID
 	entity := fmt.Sprintf("%s:%d", typeName, len(validated))
 
@@ -217,6 +225,13 @@ func cmdUpdate(db *DB, args []string) error {
 	if len(results) == 0 {
 		fmt.Println("No matching records found.")
 		return nil
+	}
+
+	// Validate ref fields point to existing entities
+	if err := db.Schema.ValidateRefs(op.TypeName, op.SetFields, func(entityID string) bool {
+		return db.Store.Exists(entityID, "__type") || db.Store.Exists(entityID, "name") || db.Store.Exists(entityID, "id")
+	}); err != nil {
+		return fmt.Errorf("ref validation failed: %w", err)
 	}
 
 	for _, entity := range results {
@@ -400,30 +415,65 @@ func executeGroupBy(db *DB, q *query.Query, rows []map[string]interface{}, useIn
 
 	groups := query.GroupByResults(rows, q.GroupBy)
 
-	// Sort group keys
+	// Sort group keys numerically if all keys are numeric, else lexicographically
 	keys := make([]string, 0, len(groups))
 	for k := range groups {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	sortGroupKeys(keys)
 
 	for _, key := range keys {
 		groupRows := groups[key]
+		displayKey := key
+		if key == query.NULLGroupKey {
+			displayKey = "NULL"
+		}
 		if q.Aggregate != "" {
 			aggResult, err := query.Aggregate(groupRows, q.Aggregate, q.AggField)
 			if err != nil {
-				fmt.Printf("%s = %v (0 rows)\n", key, 0)
+				fmt.Printf("%s = %v (0 rows)\n", displayKey, 0)
 			} else {
-				fmt.Printf("%s = %v (%d rows)\n", key, aggResult, len(groupRows))
+				fmt.Printf("%s = %v (%d rows)\n", displayKey, aggResult, len(groupRows))
 			}
 		} else {
-			fmt.Printf("%s (%d rows)\n", key, len(groupRows))
+			fmt.Printf("%s (%d rows)\n", displayKey, len(groupRows))
 		}
 	}
 
 	elapsed := float64(time.Since(start).Microseconds()) / 1000.0
 	db.QueryStats.Record(useIndex, elapsed)
 	return nil
+}
+
+// sortGroupKeys sorts group keys numerically if all are numeric, otherwise lexicographically.
+// NULLGroupKey is always placed last.
+func sortGroupKeys(keys []string) {
+	allNumeric := true
+	for _, k := range keys {
+		if k == query.NULLGroupKey {
+			continue
+		}
+		if _, err := strconv.ParseFloat(k, 64); err != nil {
+			allNumeric = false
+			break
+		}
+	}
+
+	if allNumeric {
+		sort.Slice(keys, func(i, j int) bool {
+			if keys[i] == query.NULLGroupKey {
+				return false
+			}
+			if keys[j] == query.NULLGroupKey {
+				return true
+			}
+			fi, _ := strconv.ParseFloat(keys[i], 64)
+			fj, _ := strconv.ParseFloat(keys[j], 64)
+			return fi < fj
+		})
+	} else {
+		sort.Strings(keys)
+	}
 }
 
 // formatAggLabel creates a readable label for aggregation results.
@@ -1090,9 +1140,29 @@ func cmdMigrate(db *DB, args []string) error {
 		if err := db.Schema.ApplyMigration(typeName, m); err != nil {
 			return err
 		}
+
+		// Backfill existing entities with default value if provided
+		backfilled := 0
+		for _, change := range m.Changes {
+			if change.Type == "add_field" && change.DefaultVal != nil {
+				for _, entity := range db.queryEntities(typeName, nil) {
+					if !db.Store.Exists(entity, fieldName) {
+						valType := inferType(change.DefaultVal)
+						if err := db.Store.Set(entity, fieldName, change.DefaultVal, valType); err == nil {
+							backfilled++
+						}
+					}
+				}
+			}
+		}
+
 		db.Schema.Migrations().Record(m)
 		db.persistSchema()
-		fmt.Printf("Migration applied: %s\n", m.Name)
+		if backfilled > 0 {
+			fmt.Printf("Migration applied: %s (backfilled %d entities)\n", m.Name, backfilled)
+		} else {
+			fmt.Printf("Migration applied: %s\n", m.Name)
+		}
 
 	case "remove":
 		if len(args) < 3 {

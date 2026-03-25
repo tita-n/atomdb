@@ -440,6 +440,12 @@ type serializableField struct {
 	EnumVals []string    `json:"enum_vals,omitempty"`
 }
 
+// serializableSchema is the top-level JSON structure for the schema file.
+type serializableSchema struct {
+	Types      []serializableTypeDef `json:"types"`
+	Migrations []Migration           `json:"migrations,omitempty"`
+}
+
 // SaveToFile persists the schema to a JSON file.
 func (s *Schema) SaveToFile(path string) error {
 	s.mu.RLock()
@@ -461,7 +467,12 @@ func (s *Schema) SaveToFile(path string) error {
 		defs = append(defs, serializableTypeDef{Name: td.Name, Fields: fields})
 	}
 
-	data, err := json.MarshalIndent(defs, "", "  ")
+	schema := serializableSchema{
+		Types:      defs,
+		Migrations: s.migrations.Applied(),
+	}
+
+	data, err := json.MarshalIndent(schema, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -478,15 +489,27 @@ func (s *Schema) LoadFromFile(path string) error {
 		return err
 	}
 
+	// Try new format first (with migrations)
+	var schema serializableSchema
+	if err := json.Unmarshal(data, &schema); err == nil && schema.Types != nil {
+		return s.loadFromSerializable(schema)
+	}
+
+	// Fall back to legacy format (array of type defs)
 	var defs []serializableTypeDef
 	if err := json.Unmarshal(data, &defs); err != nil {
 		return err
 	}
 
+	return s.loadFromSerializable(serializableSchema{Types: defs})
+}
+
+// loadFromSerializable loads schema from a serializableSchema structure.
+func (s *Schema) loadFromSerializable(schema serializableSchema) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, d := range defs {
+	for _, d := range schema.Types {
 		if err := validateIdentifier(d.Name); err != nil {
 			return fmt.Errorf("invalid type name %q: %w", d.Name, err)
 		}
@@ -516,6 +539,12 @@ func (s *Schema) LoadFromFile(path string) error {
 		}
 		s.types[d.Name] = &TypeDef{Name: d.Name, Fields: fields, fieldSet: fs}
 	}
+
+	// Restore migrations
+	if len(schema.Migrations) > 0 {
+		s.migrations.migrations = schema.Migrations
+	}
+
 	return nil
 }
 
@@ -539,4 +568,37 @@ func ParseFieldType(s string) FieldType {
 	default:
 		return TypeString
 	}
+}
+
+// ValidateRefs checks that all ref fields in the given values point to existing entities.
+// The existsFn callback should return true if the entity exists in the store.
+func (s *Schema) ValidateRefs(typeName string, fields map[string]interface{}, existsFn func(entityID string) bool) error {
+	s.mu.RLock()
+	td, ok := s.types[typeName]
+	s.mu.RUnlock()
+
+	if !ok {
+		return nil // unknown type, skip ref validation
+	}
+
+	for _, fd := range td.Fields {
+		if fd.Type != TypeRef {
+			continue
+		}
+		val, exists := fields[fd.Name]
+		if !exists || val == nil {
+			continue // missing or nil ref is OK if optional
+		}
+		refID, ok := val.(string)
+		if !ok {
+			continue // type error caught by Validate
+		}
+		if refID == "" {
+			continue
+		}
+		if !existsFn(refID) {
+			return fmt.Errorf("referential integrity violation: field %q references non-existent entity %q", fd.Name, refID)
+		}
+	}
+	return nil
 }

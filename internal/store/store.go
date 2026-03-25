@@ -260,8 +260,8 @@ func (s *AtomStore) HasIndex(attribute string) bool {
 }
 
 // QueryEntities finds all entity IDs of a given type matching conditions.
-// Uses B-Tree indexes when available for the first condition, falls back to
-// entity-grouped scan otherwise. This is the primary query path for SELECT/UPDATE/DELETE.
+// Uses B-Tree indexes when available — intersects results from multiple indexed
+// conditions for optimal filtering, falls back to entity-grouped scan otherwise.
 func (s *AtomStore) QueryEntities(typeName string, conditions []Condition) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -272,9 +272,13 @@ func (s *AtomStore) QueryEntities(typeName string, conditions []Condition) []str
 		return s.scanEntitiesByPrefix(prefix)
 	}
 
-	// Find the first condition whose field has an index — use it for fast lookup
-	for ci, cond := range conditions {
+	// Collect all indexed conditions and their results
+	var indexedResults [][]string
+	var unindexed []Condition
+
+	for _, cond := range conditions {
 		if !s.idx.HasIndex(cond.Field) {
+			unindexed = append(unindexed, cond)
 			continue
 		}
 
@@ -286,26 +290,81 @@ func (s *AtomStore) QueryEntities(typeName string, conditions []Condition) []str
 			rangeOp := operatorToRangeOp(cond.Operator)
 			keys = s.idx.RangeSearchByValue(cond.Field, rangeOp, cond.Value)
 		default:
+			unindexed = append(unindexed, cond)
 			continue
 		}
 
-		if keys == nil || len(keys) == 0 {
+		if len(keys) == 0 {
+			return nil // indexed lookup found nothing
+		}
+		indexedResults = append(indexedResults, keys)
+	}
+
+	// If we have indexed results, intersect them
+	if len(indexedResults) > 0 {
+		keys := intersectKeySets(indexedResults)
+		if len(keys) == 0 {
 			return nil
 		}
-
-		// Build remaining conditions (everything except the indexed one)
-		var remaining []Condition
-		for i, c := range conditions {
-			if i != ci {
-				remaining = append(remaining, c)
-			}
-		}
-
-		return s.resolveEntityKeysFiltered(keys, prefix, remaining)
+		return s.resolveEntityKeysFiltered(keys, prefix, unindexed)
 	}
 
 	// No usable index — full scan fallback grouped by entity
 	return s.scanEntitiesWithConditions(prefix, conditions)
+}
+
+// intersectKeySets returns entity keys present in ALL sets.
+// Keys are in "entity.attribute" format — we extract just the entity part
+// for comparison, then return the full keys from the first set.
+func intersectKeySets(sets [][]string) []string {
+	if len(sets) == 0 {
+		return nil
+	}
+	if len(sets) == 1 {
+		return sets[0]
+	}
+
+	// Use smallest set as base for intersection
+	minIdx := 0
+	for i := 1; i < len(sets); i++ {
+		if len(sets[i]) < len(sets[minIdx]) {
+			minIdx = i
+		}
+	}
+
+	// Build entity-ID set from smallest
+	entityToKey := make(map[string]string, len(sets[minIdx]))
+	base := make(map[string]struct{}, len(sets[minIdx]))
+	for _, k := range sets[minIdx] {
+		parts := splitEntityAttr(k)
+		entity := parts[0]
+		entityToKey[entity] = k
+		base[entity] = struct{}{}
+	}
+
+	// Intersect with each other set
+	for i := 0; i < len(sets); i++ {
+		if i == minIdx {
+			continue
+		}
+		next := make(map[string]struct{}, len(sets[i]))
+		for _, k := range sets[i] {
+			parts := splitEntityAttr(k)
+			next[parts[0]] = struct{}{}
+		}
+		for entity := range base {
+			if _, ok := next[entity]; !ok {
+				delete(base, entity)
+			}
+		}
+	}
+
+	result := make([]string, 0, len(base))
+	for entity := range base {
+		// Return the key from the first set (arbitrary but consistent)
+		result = append(result, entityToKey[entity])
+	}
+	return result
 }
 
 // scanEntitiesByPrefix returns all live entity IDs with the given prefix.
@@ -400,12 +459,37 @@ func matchConditionsLocal(attrs map[string]*atom.Atom, conditions []Condition) b
 	return true
 }
 
+// valueKind returns a category for type-safe comparison.
+func valueKind(v interface{}) string {
+	if v == nil {
+		return "nil"
+	}
+	switch v.(type) {
+	case bool:
+		return "bool"
+	case float64, float32, int, int64:
+		return "number"
+	default:
+		return "string"
+	}
+}
+
 // compareAtomValueLocal compares atom values using the given operator.
 func compareAtomValueLocal(atomVal interface{}, op string, condVal interface{}) bool {
 	switch op {
 	case "==":
+		ak := valueKind(atomVal)
+		bk := valueKind(condVal)
+		if ak != bk {
+			return false
+		}
 		return fmt.Sprintf("%v", atomVal) == fmt.Sprintf("%v", condVal)
 	case "!=":
+		ak := valueKind(atomVal)
+		bk := valueKind(condVal)
+		if ak != bk {
+			return true
+		}
 		return fmt.Sprintf("%v", atomVal) != fmt.Sprintf("%v", condVal)
 	default:
 		af := toFloatLocal(atomVal)

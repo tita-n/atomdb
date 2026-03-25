@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tita-n/atomdb/internal/atom"
+	"github.com/tita-n/atomdb/internal/disk"
 )
 
 // TransactionID is a unique identifier for a transaction.
@@ -112,7 +113,7 @@ func (tx *Transaction) Commit() error {
 	tx.Store.mu.Lock()
 	defer tx.Store.mu.Unlock()
 
-	// Apply all operations
+	// Apply all operations — persist to disk first, then apply to memory
 	for _, op := range tx.Operations {
 		switch op.Type {
 		case "set":
@@ -121,6 +122,11 @@ func (tx *Transaction) Commit() error {
 				// Rollback on error
 				tx.rollbackLocked()
 				return fmt.Errorf("transaction %d commit failed: %w", tx.ID, err)
+			}
+			// Persist to disk BEFORE applying to memory for durability
+			if err := disk.Save(a, tx.Store.file); err != nil {
+				tx.rollbackLocked()
+				return fmt.Errorf("transaction %d commit failed: disk write error: %w", tx.ID, err)
 			}
 			// Remove old from index
 			if oldAttrs, ok := tx.Store.atoms[op.Entity]; ok {
@@ -139,6 +145,11 @@ func (tx *Transaction) Commit() error {
 			if err != nil {
 				tx.rollbackLocked()
 				return fmt.Errorf("transaction %d commit failed: %w", tx.ID, err)
+			}
+			// Persist tombstone to disk
+			if err := disk.Save(tombstone, tx.Store.file); err != nil {
+				tx.rollbackLocked()
+				return fmt.Errorf("transaction %d commit failed: disk write error: %w", tx.ID, err)
 			}
 			if oldAttrs, ok := tx.Store.atoms[op.Entity]; ok {
 				if old, exists := oldAttrs[op.Attribute]; exists {
