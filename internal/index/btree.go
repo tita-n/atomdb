@@ -230,7 +230,8 @@ func (t *BTree) RangeQuery(op RangeOp, value string) []string {
 }
 
 func (t *BTree) rangeGT(value string, inclusive bool) []string {
-	result := make([]string, 0, t.count/4)
+	// Start with small capacity - grow dynamically to avoid over-allocation
+	result := make([]string, 0, 64)
 	t.collectGT(t.root, value, inclusive, &result)
 	return result
 }
@@ -268,7 +269,8 @@ func (t *BTree) collectGT(n *BTreeNode, value string, inclusive bool, result *[]
 }
 
 func (t *BTree) rangeLT(value string, inclusive bool) []string {
-	result := make([]string, 0, t.count/4)
+	// Start with small capacity - grow dynamically to avoid over-allocation
+	result := make([]string, 0, 64)
 	t.collectLT(t.root, value, inclusive, &result)
 	return result
 }
@@ -327,6 +329,123 @@ func (t *BTree) Count() int {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.count
+}
+
+// CountSearch returns the number of entity entries for an exact key match.
+// O(log n) — avoids materializing the result slice.
+func (t *BTree) CountSearch(key string) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.countSearch(t.root, key)
+}
+
+func (t *BTree) countSearch(n *BTreeNode, key string) int {
+	i := sort.Search(len(n.keys), func(i int) bool {
+		return n.keys[i] >= key
+	})
+
+	if i < len(n.keys) && n.keys[i] == key {
+		return len(n.values[i])
+	}
+
+	if n.leaf {
+		return 0
+	}
+
+	return t.countSearch(n.children[i], key)
+}
+
+// CountRange returns the count of entity entries matching a range query.
+// O(log n + k) where k is the number of matching entries — avoids materializing the result slice.
+func (t *BTree) CountRange(op RangeOp, value string) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	var count int
+	switch op {
+	case OpGt:
+		t.countGT(t.root, value, false, &count)
+	case OpGte:
+		t.countGT(t.root, value, true, &count)
+	case OpLt:
+		t.countLT(t.root, value, false, &count)
+	case OpLte:
+		t.countLT(t.root, value, true, &count)
+	}
+	return count
+}
+
+func (t *BTree) countGT(n *BTreeNode, value string, inclusive bool, count *int) {
+	i := sort.Search(len(n.keys), func(i int) bool {
+		if inclusive {
+			return n.keys[i] >= value
+		}
+		return n.keys[i] > value
+	})
+
+	if n.leaf {
+		for ; i < len(n.keys); i++ {
+			*count += len(n.values[i])
+		}
+		return
+	}
+
+	if i < len(n.children) {
+		t.countGT(n.children[i], value, inclusive, count)
+	}
+
+	for ; i < len(n.keys); i++ {
+		*count += len(n.values[i])
+		if i+1 < len(n.children) {
+			t.countAll(n.children[i+1], count)
+		}
+	}
+}
+
+func (t *BTree) countLT(n *BTreeNode, value string, inclusive bool, count *int) {
+	i := sort.Search(len(n.keys), func(i int) bool {
+		if inclusive {
+			return n.keys[i] > value
+		}
+		return n.keys[i] >= value
+	})
+
+	if n.leaf {
+		for j := 0; j < i && j < len(n.keys); j++ {
+			*count += len(n.values[j])
+		}
+		return
+	}
+
+	for j := 0; j < i && j < len(n.keys); j++ {
+		if j < len(n.children) {
+			t.countLT(n.children[j], value, inclusive, count)
+		}
+		*count += len(n.values[j])
+	}
+
+	if i < len(n.children) {
+		t.countLT(n.children[i], value, inclusive, count)
+	}
+}
+
+func (t *BTree) countAll(n *BTreeNode, count *int) {
+	if n == nil {
+		return
+	}
+	if n.leaf {
+		for i := range n.values {
+			*count += len(n.values[i])
+		}
+		return
+	}
+	for i := range n.keys {
+		t.countAll(n.children[i], count)
+		*count += len(n.values[i])
+	}
+	if len(n.children) > len(n.keys) {
+		t.countAll(n.children[len(n.keys)], count)
+	}
 }
 
 func (t *BTree) Keys() []string {

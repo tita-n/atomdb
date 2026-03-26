@@ -253,6 +253,64 @@ func (im *IndexManager) RangeSearchByValue(attribute string, op RangeOp, value i
 	return bt.RangeQuery(op, key)
 }
 
+// CountSearchByValue returns the count of entities matching an exact value.
+// O(log n) — avoids materializing the result slice for aggregation counts.
+func (im *IndexManager) CountSearchByValue(attribute string, value interface{}) int {
+	im.mu.RLock()
+	bt, ok := im.indexes[attribute]
+	im.mu.RUnlock()
+
+	if !ok {
+		return 0
+	}
+
+	key := normalizeValue(value)
+
+	// If value is a string that looks like a number, try numeric key first
+	if vStr, ok := value.(string); ok {
+		if f, err := strconv.ParseFloat(vStr, 64); err == nil {
+			numKey := encodeNumericKey(f)
+			if numKey != key {
+				numResults := bt.CountSearch(numKey)
+				if numResults > 0 {
+					return numResults
+				}
+			}
+		}
+	}
+
+	return bt.CountSearch(key)
+}
+
+// CountRangeByValue returns the count of entities matching a range query.
+// O(log n + k) — avoids materializing the result slice for aggregation counts.
+func (im *IndexManager) CountRangeByValue(attribute string, op RangeOp, value interface{}) int {
+	im.mu.RLock()
+	bt, ok := im.indexes[attribute]
+	im.mu.RUnlock()
+
+	if !ok {
+		return 0
+	}
+
+	key := normalizeValue(value)
+
+	// If value is a string that looks like a number, try numeric range first
+	if vStr, ok := value.(string); ok {
+		if f, err := strconv.ParseFloat(vStr, 64); err == nil {
+			numKey := encodeNumericKey(f)
+			if numKey != key {
+				numResults := bt.CountRange(op, numKey)
+				if numResults > 0 {
+					return numResults
+				}
+			}
+		}
+	}
+
+	return bt.CountRange(op, key)
+}
+
 func (im *IndexManager) HasIndex(attribute string) bool {
 	im.mu.RLock()
 	defer im.mu.RUnlock()

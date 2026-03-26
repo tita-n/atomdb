@@ -965,34 +965,55 @@ func valueKind(v interface{}) string {
 	}
 }
 
+// compareEqual compares two values for equality without fmt.Sprintf allocation.
+// Uses direct type assertion first, falls back to string comparison only for mixed types.
+func compareEqual(a, b interface{}) bool {
+	switch va := a.(type) {
+	case float64:
+		if vb, ok := b.(float64); ok {
+			return va == vb
+		}
+	case string:
+		if vb, ok := b.(string); ok {
+			return va == vb
+		}
+	case bool:
+		if vb, ok := b.(bool); ok {
+			return va == vb
+		}
+	case int:
+		if vb, ok := b.(int); ok {
+			return va == vb
+		}
+	case int64:
+		if vb, ok := b.(int64); ok {
+			return va == vb
+		}
+	}
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
+// compareAtomValue compares atom values using the given operator.
+// Uses type-aware fast paths to avoid fmt.Sprintf allocations on hot path.
 func compareAtomValue(atomVal interface{}, op string, condVal interface{}) bool {
 	switch op {
 	case "==":
-		// Type-safe equality: types must match
-		if sameTypeKind(atomVal, condVal) == "" {
-			return false
-		}
 		if atomVal == nil && condVal == nil {
 			return true
 		}
 		if atomVal == nil || condVal == nil {
 			return false
 		}
-		return fmt.Sprintf("%v", atomVal) == fmt.Sprintf("%v", condVal)
+		return compareEqual(atomVal, condVal)
 	case "!=":
-		// Type-safe inequality
-		if sameTypeKind(atomVal, condVal) == "" {
-			return true
-		}
 		if atomVal == nil && condVal == nil {
 			return false
 		}
 		if atomVal == nil || condVal == nil {
 			return true
 		}
-		return fmt.Sprintf("%v", atomVal) != fmt.Sprintf("%v", condVal)
+		return !compareEqual(atomVal, condVal)
 	default:
-		// Numeric comparison for >, <, >=, <=
 		af := toFloat(atomVal)
 		bf := toFloat(condVal)
 		switch op {
@@ -1009,6 +1030,8 @@ func compareAtomValue(atomVal interface{}, op string, condVal interface{}) bool 
 	return false
 }
 
+// toFloat converts a value to float64 without allocation.
+// Handles all common numeric types directly via type switch.
 func toFloat(v interface{}) float64 {
 	switch n := v.(type) {
 	case float64:
@@ -1019,6 +1042,11 @@ func toFloat(v interface{}) float64 {
 		return float64(n)
 	case int64:
 		return float64(n)
+	case string:
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return f
+		}
+		return 0
 	default:
 		if f, err := strconv.ParseFloat(fmt.Sprintf("%v", v), 64); err == nil {
 			return f
@@ -1137,8 +1165,32 @@ func Aggregate(rows []map[string]interface{}, fn string, field string) (interfac
 	}
 }
 
+// groupKey converts a value to a string key for grouping without fmt.Sprintf allocation.
+// Uses type assertion for common types, falls back to fmt.Sprintf only for unknown types.
+func groupKey(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case float64:
+		// Use strconv directly for float64 to avoid allocation
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	case int:
+		return strconv.Itoa(val)
+	case int64:
+		return strconv.FormatInt(val, 10)
+	case bool:
+		if val {
+			return "true"
+		}
+		return "false"
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 // GroupByResults groups rows by a field value.
 // Rows with a nil group field are grouped under NULLGroupKey.
+// Uses type-aware key conversion to avoid fmt.Sprintf allocation.
 func GroupByResults(rows []map[string]interface{}, groupField string) map[string][]map[string]interface{} {
 	groups := make(map[string][]map[string]interface{})
 	for _, row := range rows {
@@ -1147,7 +1199,7 @@ func GroupByResults(rows []map[string]interface{}, groupField string) map[string
 		if !exists || val == nil {
 			key = NULLGroupKey
 		} else {
-			key = fmt.Sprintf("%v", val)
+			key = groupKey(val)
 		}
 		groups[key] = append(groups[key], row)
 	}

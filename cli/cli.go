@@ -312,28 +312,42 @@ func tryShorthandQuery(db *DB, args []string) error {
 }
 
 // executeQuery runs a query and prints results. Handles aggregations, GROUP BY, ORDER BY, LIMIT.
+// Optimized: count aggregation uses index-based count shortcut without materializing rows.
 func executeQuery(db *DB, q *query.Query) error {
 	start := time.Now()
+	useIndex := hasUsableIndex(db, q)
+
+	// Fast path: count aggregation uses index-based count without row materialization
+	if q.Aggregate == "count" && q.GroupBy == "" {
+		count := db.Store.CountEntities(q.TypeName, toStoreConditions(q.Conditions))
+		fmt.Printf("%s = %d\n", formatAggLabel(q.Aggregate, q.AggField, q.TypeName), count)
+		elapsed := float64(time.Since(start).Microseconds()) / 1000.0
+		db.QueryStats.Record(useIndex, elapsed)
+		return nil
+	}
 
 	// Execute query to get matching entities
 	entities := db.queryEntities(q.TypeName, q.Conditions)
-	useIndex := hasUsableIndex(db, q)
 
-	// Build result rows
+	// Pre-allocate rows slice to reduce append growth
+	entitiesCount := len(entities)
 	var rows []map[string]interface{}
+	if entitiesCount > 0 {
+		rows = make([]map[string]interface{}, 0, entitiesCount)
+	}
+
+	shouldLoadAll := q.Aggregate != "" || q.GroupBy != "" || len(q.Fields) == 0
+
 	for _, entity := range entities {
 		attrs := db.Store.GetAll(entity)
-		row := make(map[string]interface{})
+		row := make(map[string]interface{}, len(attrs)+1)
 		row["_entity"] = entity
 
-		shouldLoadAll := q.Aggregate != "" || q.GroupBy != "" || len(q.Fields) == 0
 		if shouldLoadAll {
-			// Aggregation/group by: need all fields for grouping and aggregation
 			for attr, a := range attrs {
 				row[attr] = a.Value
 			}
 		} else {
-			// Specific fields requested
 			for _, f := range q.Fields {
 				attrName := f
 				if dotIdx := strings.Index(f, "."); dotIdx >= 0 {
@@ -373,6 +387,19 @@ func executeQuery(db *DB, q *query.Query) error {
 	db.QueryStats.Record(useIndex, elapsed)
 
 	return nil
+}
+
+// toStoreConditions converts query conditions to store conditions.
+func toStoreConditions(conditions []query.Condition) []store.Condition {
+	storeConds := make([]store.Condition, len(conditions))
+	for i, c := range conditions {
+		storeConds[i] = store.Condition{
+			Field:    c.Field,
+			Operator: c.Operator,
+			Value:    c.Value,
+		}
+	}
+	return storeConds
 }
 
 // hasUsableIndex checks if the query can use a B-Tree index.
@@ -513,16 +540,7 @@ func printRows(rows []map[string]interface{}, fields []string) {
 // queryEntities finds all entities of a type matching conditions.
 // Delegates to Store.QueryEntities which uses B-Tree indexes when available.
 func (db *DB) queryEntities(typeName string, conditions []query.Condition) []string {
-	// Convert query.Condition to store.Condition
-	storeConds := make([]store.Condition, len(conditions))
-	for i, c := range conditions {
-		storeConds[i] = store.Condition{
-			Field:    c.Field,
-			Operator: c.Operator,
-			Value:    c.Value,
-		}
-	}
-	return db.Store.QueryEntities(typeName, storeConds)
+	return db.Store.QueryEntities(typeName, toStoreConditions(conditions))
 }
 
 // --- Raw commands (backward compatibility) ---

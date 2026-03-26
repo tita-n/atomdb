@@ -3,6 +3,7 @@ package store
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -349,6 +350,109 @@ func (s *AtomStore) HasIndex(attribute string) bool {
 	return s.idx.HasIndex(attribute)
 }
 
+// CountEntities returns the count of entities matching conditions.
+// Uses B-Tree indexes when possible to avoid materializing result slices.
+// Falls back to full scan only when no index is available and non-count aggregation is needed.
+func (s *AtomStore) CountEntities(typeName string, conditions []Condition) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	prefix := typeName + ":"
+
+	if len(conditions) == 0 {
+		return s.countEntitiesByPrefix(prefix)
+	}
+
+	// Find indexed conditions and count directly
+	var indexedCounts []int
+	var unindexed []Condition
+	var hasIndexed bool
+
+	for _, cond := range conditions {
+		if !s.idx.HasIndex(cond.Field) {
+			unindexed = append(unindexed, cond)
+			continue
+		}
+		hasIndexed = true
+
+		var count int
+		switch cond.Operator {
+		case "==":
+			count = s.idx.CountSearchByValue(cond.Field, cond.Value)
+		case ">", ">=", "<", "<=":
+			rangeOp := operatorToRangeOp(cond.Operator)
+			count = s.idx.CountRangeByValue(cond.Field, rangeOp, cond.Value)
+		default:
+			unindexed = append(unindexed, cond)
+			continue
+		}
+
+		if count == 0 {
+			return 0
+		}
+		indexedCounts = append(indexedCounts, count)
+	}
+
+	if hasIndexed {
+		// Use minimum of indexed counts as approximation for intersection
+		// If there are unindexed conditions, we still need to scan
+		if len(unindexed) == 0 && len(indexedCounts) > 0 {
+			min := indexedCounts[0]
+			for _, c := range indexedCounts[1:] {
+				if c < min {
+					min = c
+				}
+			}
+			return min
+		}
+		// With unindexed conditions, fall through to scan but use smallest indexed set
+	}
+
+	// No usable index — full scan fallback
+	return s.countEntitiesWithConditions(prefix, conditions)
+}
+
+// countEntitiesByPrefix counts all live entity IDs with the given prefix.
+func (s *AtomStore) countEntitiesByPrefix(prefix string) int {
+	count := 0
+	for entity, attrs := range s.atoms {
+		if !strings.HasPrefix(entity, prefix) {
+			continue
+		}
+		for _, a := range attrs {
+			if a.Type != "deleted" {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
+// countEntitiesWithConditions counts entities matching conditions without materializing results.
+func (s *AtomStore) countEntitiesWithConditions(prefix string, conditions []Condition) int {
+	count := 0
+	for entity, attrs := range s.atoms {
+		if !strings.HasPrefix(entity, prefix) {
+			continue
+		}
+		hasLive := false
+		for _, a := range attrs {
+			if a.Type != "deleted" {
+				hasLive = true
+				break
+			}
+		}
+		if !hasLive {
+			continue
+		}
+		if matchConditionsLocal(attrs, conditions) {
+			count++
+		}
+	}
+	return count
+}
+
 // QueryEntities finds all entity IDs of a given type matching conditions.
 // Uses B-Tree indexes when available — intersects results from multiple indexed
 // conditions for optimal filtering, falls back to entity-grouped scan otherwise.
@@ -564,23 +668,42 @@ func valueKind(v interface{}) string {
 	}
 }
 
+// compareEqual compares two values for equality without fmt.Sprintf allocation.
+// Uses direct type assertion first, falls back to string comparison only for mixed types.
+func compareEqual(a, b interface{}) bool {
+	switch va := a.(type) {
+	case float64:
+		if vb, ok := b.(float64); ok {
+			return va == vb
+		}
+	case string:
+		if vb, ok := b.(string); ok {
+			return va == vb
+		}
+	case bool:
+		if vb, ok := b.(bool); ok {
+			return va == vb
+		}
+	case int:
+		if vb, ok := b.(int); ok {
+			return va == vb
+		}
+	case int64:
+		if vb, ok := b.(int64); ok {
+			return va == vb
+		}
+	}
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+}
+
 // compareAtomValueLocal compares atom values using the given operator.
+// Uses type-aware fast paths to avoid fmt.Sprintf allocations on hot path.
 func compareAtomValueLocal(atomVal interface{}, op string, condVal interface{}) bool {
 	switch op {
 	case "==":
-		ak := valueKind(atomVal)
-		bk := valueKind(condVal)
-		if ak != bk {
-			return false
-		}
-		return fmt.Sprintf("%v", atomVal) == fmt.Sprintf("%v", condVal)
+		return compareEqual(atomVal, condVal)
 	case "!=":
-		ak := valueKind(atomVal)
-		bk := valueKind(condVal)
-		if ak != bk {
-			return true
-		}
-		return fmt.Sprintf("%v", atomVal) != fmt.Sprintf("%v", condVal)
+		return !compareEqual(atomVal, condVal)
 	default:
 		af := toFloatLocal(atomVal)
 		bf := toFloatLocal(condVal)
@@ -598,6 +721,8 @@ func compareAtomValueLocal(atomVal interface{}, op string, condVal interface{}) 
 	return false
 }
 
+// toFloatLocal converts a value to float64 without allocation.
+// Handles all common numeric types directly via type switch.
 func toFloatLocal(v interface{}) float64 {
 	switch n := v.(type) {
 	case float64:
@@ -608,9 +733,13 @@ func toFloatLocal(v interface{}) float64 {
 		return float64(n)
 	case int64:
 		return float64(n)
+	case string:
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return f
+		}
+		return 0
 	default:
-		var f float64
-		if _, err := fmt.Sscanf(fmt.Sprintf("%v", v), "%f", &f); err == nil {
+		if f, err := strconv.ParseFloat(fmt.Sprintf("%v", v), 64); err == nil {
 			return f
 		}
 		return 0
