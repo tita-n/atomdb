@@ -84,11 +84,7 @@ func Parse(input string) (*ParsedInput, error) {
 	upper := strings.ToUpper(input)
 	lower := strings.ToLower(input)
 
-	// Route group by and aggregation queries to shorthand parser first
-	if strings.Contains(lower, "group by") || hasAggFunc(lower) {
-		return parseShorthand(input)
-	}
-
+	// Route explicit commands first, before checking for aggregation keywords
 	switch {
 	case strings.HasPrefix(upper, "TYPE "):
 		return parseType(input)
@@ -100,10 +96,15 @@ func Parse(input string) (*ParsedInput, error) {
 		return parseDelete(input)
 	case strings.HasPrefix(upper, "SELECT "):
 		return parseSelect(input[7:])
-	default:
-		// Try as shorthand query: "type where condition" or "type.field where ..."
+	}
+
+	// Then check for group by and aggregation in shorthand queries
+	if strings.Contains(lower, "group by") || hasAggFunc(lower) {
 		return parseShorthand(input)
 	}
+
+	// Try as shorthand query: "type where condition" or "type.field where ..."
+	return parseShorthand(input)
 }
 
 func parseType(input string) (*ParsedInput, error) {
@@ -295,6 +296,38 @@ func parseSelect(input string) (*ParsedInput, error) {
 		if err == nil {
 			q.Limit = n
 		}
+		if len(parts) > 1 {
+			input = strings.TrimSpace(parts[1])
+		} else {
+			input = ""
+		}
+	}
+
+	// Parse GROUP BY
+	if strings.HasPrefix(strings.ToLower(input), "group by ") {
+		groupField := strings.TrimSpace(input[9:])
+		// Check for aggregation in fields part (e.g., "count(*)" in selected fields)
+		for i, f := range q.Fields {
+			if af, _, afField := parseAggFunc(f); af != "" {
+				q.Aggregate = af
+				q.AggField = afField
+				q.Fields = append(q.Fields[:i], q.Fields[i+1:]...)
+				break
+			}
+		}
+		// Infer type from group field or selected fields
+		if dotIdx := strings.Index(groupField, "."); dotIdx >= 0 {
+			q.TypeName = groupField[:dotIdx]
+			q.GroupBy = groupField[dotIdx+1:]
+		} else {
+			q.GroupBy = groupField
+			for _, f := range q.Fields {
+				if dotIdx := strings.Index(f, "."); dotIdx >= 0 {
+					q.TypeName = f[:dotIdx]
+					break
+				}
+			}
+		}
 	}
 
 	return &ParsedInput{
@@ -448,6 +481,7 @@ func parseAggFunc(input string) (fn string, typeName string, field string) {
 }
 
 // removeAggFunc strips aggregation function from input string.
+// Handles nested parentheses correctly by tracking depth.
 func removeAggFunc(input string) string {
 	aggFuncs := []string{"count", "sum", "avg", "min", "max"}
 	lower := strings.ToLower(input)
@@ -457,12 +491,25 @@ func removeAggFunc(input string) string {
 		if idx < 0 {
 			continue
 		}
-		end := strings.Index(input[idx:], ")")
+		start := idx + len(af) // position of '('
+		depth := 0
+		end := -1
+		for i := start; i < len(input); i++ {
+			if input[i] == '(' {
+				depth++
+			} else if input[i] == ')' {
+				depth--
+				if depth == 0 {
+					end = i
+					break
+				}
+			}
+		}
 		if end < 0 {
 			continue
 		}
 		before := strings.TrimSpace(input[:idx])
-		after := strings.TrimSpace(input[idx+end+1:])
+		after := strings.TrimSpace(input[end+1:])
 		return strings.TrimSpace(before + " " + after)
 	}
 	return input
@@ -647,6 +694,10 @@ func parseWhere(input string) ([]Condition, error) {
 	i := 0
 	for i < len(tokens) {
 		if i+2 >= len(tokens) {
+			// Trailing incomplete condition
+			if i < len(tokens) {
+				return nil, fmt.Errorf("incomplete condition at %q (need field, operator, value)", tokens[i])
+			}
 			break
 		}
 
@@ -893,10 +944,62 @@ func findClauseIndex(input string) int {
 	clauses := []string{"order by", "limit", "group by"}
 	lower := strings.ToLower(input)
 	minIdx := -1
+
+	// Track quoted regions to avoid matching clause keywords inside quotes
+	inQuote := false
+	quoteChar := byte(0)
+	for i := 0; i < len(input); i++ {
+		if inQuote {
+			if input[i] == quoteChar {
+				inQuote = false
+			}
+			continue
+		}
+		if input[i] == '"' || input[i] == '\'' {
+			inQuote = true
+			quoteChar = input[i]
+			continue
+		}
+	}
+
+	// Build a mask of quoted positions
+	quoted := make([]bool, len(input))
+	inQuote = false
+	quoteChar = 0
+	for i := 0; i < len(input); i++ {
+		if inQuote {
+			quoted[i] = true
+			if input[i] == quoteChar {
+				inQuote = false
+			}
+			continue
+		}
+		if input[i] == '"' || input[i] == '\'' {
+			inQuote = true
+			quoteChar = input[i]
+			quoted[i] = true
+		}
+	}
+
 	for _, c := range clauses {
 		idx := strings.Index(lower, c)
-		if idx >= 0 && (minIdx < 0 || idx < minIdx) {
-			minIdx = idx
+		// Walk through all matches, skip those inside quotes
+		for idx >= 0 {
+			// Check if this match is inside a quoted region
+			if !quoted[idx] {
+				if minIdx < 0 || idx < minIdx {
+					minIdx = idx
+				}
+				break
+			}
+			nextSearch := idx + len(c)
+			if nextSearch >= len(lower) {
+				break
+			}
+			idx = strings.Index(lower[nextSearch:], c)
+			if idx >= 0 {
+				idx += nextSearch
+			}
 		}
 	}
 	return minIdx
@@ -1107,6 +1210,9 @@ func Aggregate(rows []map[string]interface{}, fn string, field string) (interfac
 		var total float64
 		for _, row := range rows {
 			if v, ok := row[field]; ok && v != nil {
+				if !isNumericValue(v) {
+					return nil, fmt.Errorf("sum: field %q contains non-numeric value %v", field, v)
+				}
 				total += toFloat(v)
 			}
 		}
@@ -1117,6 +1223,9 @@ func Aggregate(rows []map[string]interface{}, fn string, field string) (interfac
 		count := 0
 		for _, row := range rows {
 			if v, ok := row[field]; ok && v != nil {
+				if !isNumericValue(v) {
+					return nil, fmt.Errorf("avg: field %q contains non-numeric value %v", field, v)
+				}
 				total += toFloat(v)
 				count++
 			}
@@ -1131,6 +1240,9 @@ func Aggregate(rows []map[string]interface{}, fn string, field string) (interfac
 		found := false
 		for _, row := range rows {
 			if v, ok := row[field]; ok && v != nil {
+				if !isNumericValue(v) {
+					return nil, fmt.Errorf("min: field %q contains non-numeric value %v", field, v)
+				}
 				f := toFloat(v)
 				if !found || f < min {
 					min = f
@@ -1148,6 +1260,9 @@ func Aggregate(rows []map[string]interface{}, fn string, field string) (interfac
 		found := false
 		for _, row := range rows {
 			if v, ok := row[field]; ok && v != nil {
+				if !isNumericValue(v) {
+					return nil, fmt.Errorf("max: field %q contains non-numeric value %v", field, v)
+				}
 				f := toFloat(v)
 				if !found || f > max {
 					max = f
@@ -1162,6 +1277,18 @@ func Aggregate(rows []map[string]interface{}, fn string, field string) (interfac
 
 	default:
 		return nil, fmt.Errorf("unknown aggregate function: %q", fn)
+	}
+}
+
+func isNumericValue(v interface{}) bool {
+	switch v.(type) {
+	case float64, float32, int, int64:
+		return true
+	case string:
+		_, err := strconv.ParseFloat(v.(string), 64)
+		return err == nil
+	default:
+		return false
 	}
 }
 

@@ -131,3 +131,102 @@ func TestGroupByResults(t *testing.T) {
 		t.Errorf("NYC group = %d, want 1", len(groups["NYC"]))
 	}
 }
+
+func TestAggregateSumNonNumeric(t *testing.T) {
+	rows := []map[string]interface{}{
+		{"name": "Alice"},
+		{"name": "Bob"},
+	}
+	_, err := Aggregate(rows, "sum", "name")
+	if err == nil {
+		t.Error("sum on non-numeric field should return error")
+	}
+}
+
+func TestAggregateMinNonNumeric(t *testing.T) {
+	rows := []map[string]interface{}{
+		{"name": "Alice"},
+	}
+	_, err := Aggregate(rows, "min", "name")
+	if err == nil {
+		t.Error("min on non-numeric field should return error")
+	}
+}
+
+func TestRemoveAggFuncNestedParens(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"sum(price * (1 + tax)) where x == 1", "where x == 1"},
+		{"count(person) where age > 25", "where age > 25"},
+		{"avg(x * (a + (b - c))) order by name", "order by name"},
+	}
+	for _, tt := range tests {
+		got := removeAggFunc(tt.input)
+		if got != tt.expected {
+			t.Errorf("removeAggFunc(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestFindClauseIndexRespectsQuotes(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int
+	}{
+		// "order by" inside quotes should not match
+		{`name == "order by me" and age > 25`, -1},
+		// unquoted "order by" should match
+		{`name == test order by age`, 13},
+		// "limit" inside quotes should not match
+		{`name == "limit 10"`, -1},
+	}
+	for _, tt := range tests {
+		got := findClauseIndex(tt.input)
+		if got != tt.expected {
+			t.Errorf("findClauseIndex(%q) = %d, want %d", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestParseWhereTrailingIncomplete(t *testing.T) {
+	_, err := parseWhere("name")
+	if err == nil {
+		t.Error("parseWhere with trailing incomplete condition should return error")
+	}
+
+	_, err = parseWhere("name ==")
+	if err == nil {
+		t.Error("parseWhere with missing value should return error")
+	}
+}
+
+func TestParseSelectGroupBy(t *testing.T) {
+	parsed, err := Parse("SELECT city FROM person GROUP BY city")
+	if err != nil {
+		t.Fatalf("Parse SELECT GROUP BY error: %v", err)
+	}
+	if parsed.Query.GroupBy != "city" {
+		t.Errorf("GroupBy = %q, want 'city'", parsed.Query.GroupBy)
+	}
+	if parsed.Query.TypeName != "person" {
+		t.Errorf("TypeName = %q, want 'person'", parsed.Query.TypeName)
+	}
+}
+
+func TestParseSelectGroupByWithAggregation(t *testing.T) {
+	parsed, err := Parse("SELECT city, count(*) FROM person GROUP BY city")
+	if err != nil {
+		t.Fatalf("Parse SELECT GROUP BY with agg error: %v", err)
+	}
+	if parsed.Query.GroupBy != "city" {
+		t.Errorf("GroupBy = %q, want 'city'", parsed.Query.GroupBy)
+	}
+	if parsed.Query.Aggregate != "count" {
+		t.Errorf("Aggregate = %q, want 'count'", parsed.Query.Aggregate)
+	}
+	if len(parsed.Query.Fields) != 1 || parsed.Query.Fields[0] != "city" {
+		t.Errorf("Fields = %v, want ['city']", parsed.Query.Fields)
+	}
+}

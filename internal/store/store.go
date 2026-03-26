@@ -363,6 +363,13 @@ func (s *AtomStore) CountEntities(typeName string, conditions []Condition) int {
 		return s.countEntitiesByPrefix(prefix)
 	}
 
+	// OR conditions require full scan — indexed count only supports AND
+	for _, cond := range conditions {
+		if strings.ToUpper(cond.Logic) == "OR" {
+			return s.countEntitiesWithConditions(prefix, conditions)
+		}
+	}
+
 	// Find indexed conditions and count directly
 	var indexedCounts []int
 	var unindexed []Condition
@@ -464,6 +471,18 @@ func (s *AtomStore) QueryEntities(typeName string, conditions []Condition) []str
 
 	if len(conditions) == 0 {
 		return s.scanEntitiesByPrefix(prefix)
+	}
+
+	// OR conditions require full scan — indexed intersection only supports AND
+	hasOR := false
+	for _, cond := range conditions {
+		if strings.ToUpper(cond.Logic) == "OR" {
+			hasOR = true
+			break
+		}
+	}
+	if hasOR {
+		return s.scanEntitiesWithConditions(prefix, conditions)
 	}
 
 	// Collect all indexed conditions and their results
@@ -639,18 +658,42 @@ func (s *AtomStore) scanEntitiesWithConditions(prefix string, conditions []Condi
 	return results
 }
 
-// matchConditionsLocal checks if entity attributes satisfy all conditions.
+// matchConditionsLocal checks if entity attributes satisfy conditions.
+// Supports AND/OR logic: groups conditions by OR boundaries, all conditions
+// within each group must pass (AND), at least one group must pass (OR).
 func matchConditionsLocal(attrs map[string]*atom.Atom, conditions []Condition) bool {
-	for _, cond := range conditions {
-		a, ok := attrs[cond.Field]
-		if !ok || a.Type == "deleted" {
-			return false
-		}
-		if !compareAtomValueLocal(a.Value, cond.Operator, cond.Value) {
-			return false
+	if len(conditions) == 0 {
+		return true
+	}
+
+	orGroups := [][]Condition{}
+	var currentGroup []Condition
+
+	for i, cond := range conditions {
+		currentGroup = append(currentGroup, cond)
+		if i < len(conditions)-1 && strings.ToUpper(conditions[i].Logic) == "OR" {
+			orGroups = append(orGroups, currentGroup)
+			currentGroup = nil
 		}
 	}
-	return true
+	if len(currentGroup) > 0 {
+		orGroups = append(orGroups, currentGroup)
+	}
+
+	for _, group := range orGroups {
+		groupPass := true
+		for _, cond := range group {
+			a, ok := attrs[cond.Field]
+			if !ok || a.Type == "deleted" || !compareAtomValueLocal(a.Value, cond.Operator, cond.Value) {
+				groupPass = false
+				break
+			}
+		}
+		if groupPass {
+			return true
+		}
+	}
+	return false
 }
 
 // valueKind returns a category for type-safe comparison.
@@ -766,6 +809,7 @@ type Condition struct {
 	Field    string
 	Operator string
 	Value    interface{}
+	Logic    string // AND or OR to next condition (empty for last)
 }
 
 func (s *AtomStore) QueryIndexed(attribute, value string) []*atom.Atom {

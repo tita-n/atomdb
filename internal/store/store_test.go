@@ -569,3 +569,48 @@ func TestIntegration_NumericRangeEdgeCases(t *testing.T) {
 		t.Errorf("score<=0: got %d, want 2: %v", len(lte), lte)
 	}
 }
+
+func TestStoreQueryEntitiesOR(t *testing.T) {
+	s, _ := New(tempDB(t))
+	defer s.Close()
+
+	s.Set("person:1", "city", "Lagos", "string")
+	s.Set("person:1", "age", 20.0, "number")
+	s.Set("person:2", "city", "Abuja", "string")
+	s.Set("person:2", "age", 30.0, "number")
+	s.Set("person:3", "city", "Lagos", "string")
+	s.Set("person:3", "age", 40.0, "number")
+
+	// city == Lagos OR age > 35
+	// person:1 (Lagos, age=20) matches via city
+	// person:2 (Abuja, age=30) matches neither
+	// person:3 (Lagos, age=40) matches both
+	results := s.QueryEntities("person", []Condition{
+		{Field: "city", Operator: "==", Value: "Lagos", Logic: "OR"},
+		{Field: "age", Operator: ">", Value: 35.0, Logic: ""},
+	})
+	if len(results) != 2 {
+		t.Errorf("city==Lagos OR age>35: got %d, want 2: %v", len(results), results)
+	}
+}
+
+func TestStoreQueryEntitiesAND(t *testing.T) {
+	s, _ := New(tempDB(t))
+	defer s.Close()
+
+	s.Set("person:1", "city", "Lagos", "string")
+	s.Set("person:1", "age", 20.0, "number")
+	s.Set("person:2", "city", "Lagos", "string")
+	s.Set("person:2", "age", 30.0, "number")
+	s.Set("person:3", "city", "Abuja", "string")
+	s.Set("person:3", "age", 40.0, "number")
+
+	// city == Lagos AND age > 25 — default (empty Logic = AND in single group)
+	results := s.QueryEntities("person", []Condition{
+		{Field: "city", Operator: "==", Value: "Lagos", Logic: "AND"},
+		{Field: "age", Operator: ">", Value: 25.0, Logic: ""},
+	})
+	if len(results) != 1 {
+		t.Errorf("city==Lagos AND age>25: got %d, want 1: %v", len(results), results)
+	}
+}

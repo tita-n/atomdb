@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -41,18 +42,22 @@ func TestSanitizeEntityIDValue(t *testing.T) {
 		{float64(42), "n42"},
 		{true, "true"},
 		{false, "false"},
-		{"long" + string(make([]byte, 300)) + "string", "long" + string(make([]byte, 253))},
 	}
 
 	for _, tt := range tests {
-		t.Run("", func(t *testing.T) {
+		t.Run(fmt.Sprintf("%v", tt.input), func(t *testing.T) {
 			got := sanitizeEntityIDValue(tt.input)
-			if tt.input == float64(42) || tt.input == true || tt.input == false {
-				if got != tt.expected {
-					t.Errorf("sanitizeEntityIDValue(%v) = %q, want %q", tt.input, got, tt.expected)
-				}
+			if got != tt.expected {
+				t.Errorf("sanitizeEntityIDValue(%v) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
+	}
+
+	// Test string truncation separately
+	longInput := "long" + string(make([]byte, 300)) + "string"
+	got := sanitizeEntityIDValue(longInput)
+	if len(got) > 256 {
+		t.Errorf("sanitizeEntityIDValue: result length %d exceeds 256", len(got))
 	}
 }
 

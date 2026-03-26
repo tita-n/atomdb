@@ -1,7 +1,6 @@
 package query
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/tita-n/atomdb/internal/atom"
@@ -478,4 +477,41 @@ func TestParseWhere_InjectionAttempt(t *testing.T) {
 	}
 }
 
-var _ = reflect.ValueOf
+func TestParseTypeNotInterceptedByAggFunc(t *testing.T) {
+	parsed, err := Parse("TYPE counter { count_amount: number }")
+	if err != nil {
+		t.Fatalf("Parse TYPE error: %v", err)
+	}
+	if parsed.Command != "TYPE" {
+		t.Errorf("Command = %q, want TYPE (aggregation keyword should not intercept)", parsed.Command)
+	}
+}
+
+func TestParseInsertNotInterceptedByAggFunc(t *testing.T) {
+	parsed, err := Parse("INSERT counter name:count test")
+	if err != nil {
+		t.Fatalf("Parse INSERT error: %v", err)
+	}
+	if parsed.Command != "INSERT" {
+		t.Errorf("Command = %q, want INSERT (aggregation keyword should not intercept)", parsed.Command)
+	}
+}
+
+func TestParseSelectGroupByFromSQL(t *testing.T) {
+	parsed, err := Parse("SELECT city, count(*) FROM person GROUP BY city")
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+	if parsed.Command != "SELECT" {
+		t.Errorf("Command = %q, want SELECT", parsed.Command)
+	}
+	if parsed.Query.TypeName != "person" {
+		t.Errorf("TypeName = %q, want 'person'", parsed.Query.TypeName)
+	}
+	if parsed.Query.GroupBy != "city" {
+		t.Errorf("GroupBy = %q, want 'city'", parsed.Query.GroupBy)
+	}
+	if parsed.Query.Aggregate != "count" {
+		t.Errorf("Aggregate = %q, want 'count'", parsed.Query.Aggregate)
+	}
+}
