@@ -281,6 +281,13 @@ func (im *IndexManager) TotalKeys() int {
 	return total
 }
 
+// IndexCount returns the number of indexes.
+func (im *IndexManager) IndexCount() int {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	return len(im.indexes)
+}
+
 func (im *IndexManager) indexText(attribute, entity, text string) {
 	im.mu.Lock()
 	ii, ok := im.textIdx[attribute]

@@ -101,7 +101,7 @@ func Load(path string) ([]atom.Atom, error) {
 		case "string", "number", "boolean", "ref", "timestamp", "deleted", "":
 			// valid
 		default:
-			log.Printf("WARNING: skipping line %d: unknown atom type %q", lineNum, da.Type)
+			log.Printf("WARNING: skipping line %d: unknown atom type", lineNum)
 			continue
 		}
 

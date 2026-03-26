@@ -18,12 +18,14 @@ const (
 	DefaultMaxEntities = 100000
 	DefaultMaxAtoms    = 1000000
 	DefaultMaxAttrs    = 1000
+	DefaultMaxIndexes  = 100
 )
 
 type StoreLimits struct {
 	MaxEntities int
 	MaxAtoms    int
 	MaxAttrs    int
+	MaxIndexes  int
 }
 
 func DefaultLimits() StoreLimits {
@@ -31,6 +33,7 @@ func DefaultLimits() StoreLimits {
 		MaxEntities: DefaultMaxEntities,
 		MaxAtoms:    DefaultMaxAtoms,
 		MaxAttrs:    DefaultMaxAttrs,
+		MaxIndexes:  DefaultMaxIndexes,
 	}
 }
 
@@ -204,6 +207,93 @@ func (s *AtomStore) Exists(entity, attribute string) bool {
 	}
 	a, ok := attrs[attribute]
 	return ok && a.Type != "deleted"
+}
+
+// EntityExists checks if any live attribute exists for the given entity.
+func (s *AtomStore) EntityExists(entity string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	attrs, ok := s.atoms[entity]
+	if !ok {
+		return false
+	}
+	for _, a := range attrs {
+		if a.Type != "deleted" {
+			return true
+		}
+	}
+	return false
+}
+
+// InsertIfNotExists atomically inserts all fields for a new entity.
+// Returns error if entity already exists (race-safe duplicate detection).
+func (s *AtomStore) InsertIfNotExists(entity string, fields map[string]interface{}, typeFn func(v interface{}) string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if entity already exists (any live attribute)
+	if attrs, ok := s.atoms[entity]; ok {
+		for _, a := range attrs {
+			if a.Type != "deleted" {
+				return fmt.Errorf("duplicate entity: %q already exists", entity)
+			}
+		}
+	}
+
+	// Check entity limit
+	if len(s.atoms) >= s.limits.MaxEntities {
+		return fmt.Errorf("maximum entity count (%d) exceeded", s.limits.MaxEntities)
+	}
+
+	// Validate constraints and limits before writing
+	typeName := entity
+	if idx := strings.Index(entity, ":"); idx > 0 {
+		typeName = entity[:idx]
+	}
+
+	if len(fields) > s.limits.MaxAttrs {
+		return fmt.Errorf("too many attributes (%d) for entity %q (max %d)", len(fields), entity, s.limits.MaxAttrs)
+	}
+
+	for attr, val := range fields {
+		if err := s.constraints.Validate(typeName, attr, val, entity); err != nil {
+			return err
+		}
+	}
+
+	// Check total atom limit
+	newCount := len(fields)
+	if existing, ok := s.atoms[entity]; ok {
+		for _, a := range existing {
+			if a.Type != "deleted" {
+				newCount--
+			}
+		}
+	}
+	if s.atomCount()+newCount > s.limits.MaxAtoms {
+		return fmt.Errorf("maximum atom count (%d) exceeded", s.limits.MaxAtoms)
+	}
+
+	// All checks passed — write atoms
+	for attr, val := range fields {
+		valType := typeFn(val)
+		a, err := atom.NewAtom(entity, attr, val, valType)
+		if err != nil {
+			return err
+		}
+		if err := disk.Save(a, s.file); err != nil {
+			return fmt.Errorf("failed to persist atom: %w", err)
+		}
+		s.applyAtom(a)
+		s.idx.IndexAtom(a)
+		s.appendHistory(*a)
+		s.constraints.TrackUnique(typeName, attr, fmt.Sprintf("%v", val), entity)
+	}
+
+	s.dirty = true
+	s.dirtyCount += len(fields)
+	return s.maybeSync()
 }
 
 func (s *AtomStore) GetAll(entity string) map[string]*atom.Atom {
@@ -738,10 +828,14 @@ func (s *AtomStore) RebuildIndexes() {
 
 // CreateIndex creates a B-Tree index for the given type field.
 // Indexes all existing data for that field.
-func (s *AtomStore) CreateIndex(typeName, fieldName string) {
+func (s *AtomStore) CreateIndex(typeName, fieldName string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.limits.MaxIndexes > 0 && s.idx.IndexCount() >= s.limits.MaxIndexes {
+		return fmt.Errorf("maximum index count (%d) exceeded", s.limits.MaxIndexes)
+	}
 	s.idx.CreateIndex(typeName, fieldName, s.atoms)
+	return nil
 }
 
 // DropIndex drops the B-Tree index for the given field.

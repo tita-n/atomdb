@@ -2,9 +2,12 @@ package query
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/tita-n/atomdb/internal/atom"
 )
@@ -655,6 +658,11 @@ func parseWhere(input string) ([]Condition, error) {
 			return nil, fmt.Errorf("expected operator, got %q", op)
 		}
 
+		// Validate field name to prevent injection
+		if err := validateFieldName(field); err != nil {
+			return nil, fmt.Errorf("invalid field name %q: %w", field, err)
+		}
+
 		logic := ""
 		i += 3
 		if i < len(tokens) {
@@ -677,14 +685,40 @@ func parseWhere(input string) ([]Condition, error) {
 }
 
 func tokenizeWhere(input string) []string {
+	if !utf8.ValidString(input) {
+		return nil
+	}
 	var tokens []string
 	var current strings.Builder
 	inQuote := false
 	quoteChar := rune(0)
 
-	for i := 0; i < len(input); i++ {
-		r := rune(input[i])
+	runes := []rune(input)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+
+		// Reject control chars in unquoted context
+		if !inQuote && unicode.IsControl(r) && r != '\t' && r != '\n' && r != '\r' {
+			continue
+		}
+
 		if inQuote {
+			if r == '\\' && i+1 < len(runes) {
+				i++
+				next := runes[i]
+				switch next {
+				case '"', '\'', '\\':
+					current.WriteRune(next)
+				case 'n':
+					current.WriteRune('\n')
+				case 't':
+					current.WriteRune('\t')
+				default:
+					current.WriteRune(r)
+					current.WriteRune(next)
+				}
+				continue
+			}
 			if r == quoteChar {
 				inQuote = false
 				tokens = append(tokens, current.String())
@@ -701,7 +735,7 @@ func tokenizeWhere(input string) []string {
 			continue
 		}
 
-		if r == ' ' || r == '\t' || r == '\n' {
+		if unicode.IsSpace(r) {
 			if current.Len() > 0 {
 				tokens = append(tokens, current.String())
 				current.Reset()
@@ -715,15 +749,14 @@ func tokenizeWhere(input string) []string {
 				tokens = append(tokens, current.String())
 				current.Reset()
 			}
-			// Check for ==, !=, >=, <=
-			if i+1 < len(input) {
-				next := rune(input[i+1])
+			if i+1 < len(runes) {
+				next := runes[i+1]
 				if (r == '=' && next == '=') ||
 					(r == '!' && next == '=') ||
 					(r == '>' && next == '=') ||
 					(r == '<' && next == '=') {
 					tokens = append(tokens, string(r)+string(next))
-					i++ // skip the second character
+					i++
 					continue
 				}
 			}
@@ -734,7 +767,12 @@ func tokenizeWhere(input string) []string {
 		current.WriteRune(r)
 	}
 	if current.Len() > 0 {
-		tokens = append(tokens, current.String())
+		if inQuote {
+			// Unterminated quote — treat as raw token
+			tokens = append(tokens, current.String())
+		} else {
+			tokens = append(tokens, current.String())
+		}
 	}
 
 	return tokens
@@ -748,9 +786,36 @@ func isOperator(s string) bool {
 	return false
 }
 
+// validateFieldName checks that a field name contains only safe characters.
+// Fields may be "type.field" references.
+func validateFieldName(name string) error {
+	if name == "" {
+		return fmt.Errorf("field name cannot be empty")
+	}
+	if len(name) > 256 {
+		return fmt.Errorf("field name too long")
+	}
+	for i, r := range name {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("control character at position %d", i)
+		}
+		if r == '\u2028' || r == '\u2029' {
+			return fmt.Errorf("Unicode line separator at position %d", i)
+		}
+		if r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+			return fmt.Errorf("unsafe character %q at position %d", r, i)
+		}
+	}
+	return nil
+}
+
 func parseValue(s string) interface{} {
 	// Try number
 	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		// Reject NaN and Infinity to prevent injection
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			return s
+		}
 		return f
 	}
 	// Try boolean

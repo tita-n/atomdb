@@ -347,4 +347,135 @@ func TestOrderByCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestTokenizeWhere_ControlChars(t *testing.T) {
+	// Control characters in unquoted context should be stripped
+	input := "name\x01==\x02test"
+	tokens := tokenizeWhere(input)
+	if len(tokens) != 3 {
+		t.Fatalf("expected 3 tokens, got %d: %v", len(tokens), tokens)
+	}
+	if tokens[0] != "name" {
+		t.Errorf("token[0] = %q, want 'name'", tokens[0])
+	}
+}
+
+func TestTokenizeWhere_Unicode(t *testing.T) {
+	// Unicode characters should be handled properly
+	input := "名前 == 'テスト'"
+	tokens := tokenizeWhere(input)
+	if len(tokens) != 3 {
+		t.Fatalf("expected 3 tokens, got %d: %v", len(tokens), tokens)
+	}
+	if tokens[0] != "名前" {
+		t.Errorf("token[0] = %q, want '名前'", tokens[0])
+	}
+	if tokens[2] != "テスト" {
+		t.Errorf("token[2] = %q, want 'テスト'", tokens[2])
+	}
+}
+
+func TestTokenizeWhere_EscapeSequences(t *testing.T) {
+	input := `name == "test\"quote"`
+	tokens := tokenizeWhere(input)
+	if len(tokens) != 3 {
+		t.Fatalf("expected 3 tokens, got %d: %v", len(tokens), tokens)
+	}
+	if tokens[2] != `test"quote` {
+		t.Errorf("token[2] = %q, want 'test\"quote'", tokens[2])
+	}
+}
+
+func TestTokenizeWhere_InvalidUTF8(t *testing.T) {
+	input := "name == \xff\xfe"
+	tokens := tokenizeWhere(input)
+	if tokens != nil {
+		t.Errorf("expected nil for invalid UTF-8, got %v", tokens)
+	}
+}
+
+func TestParseValue_NaN(t *testing.T) {
+	val := parseValue("NaN")
+	if s, ok := val.(string); !ok || s != "NaN" {
+		t.Errorf("NaN should be returned as string, got %v (%T)", val, val)
+	}
+}
+
+func TestParseValue_Infinity(t *testing.T) {
+	val := parseValue("Infinity")
+	if s, ok := val.(string); !ok || s != "Infinity" {
+		t.Errorf("Infinity should be returned as string, got %v (%T)", val, val)
+	}
+}
+
+func TestParseValue_NegInfinity(t *testing.T) {
+	val := parseValue("-Infinity")
+	if s, ok := val.(string); !ok || s != "-Infinity" {
+		t.Errorf("-Infinity should be returned as string, got %v (%T)", val, val)
+	}
+}
+
+func TestValidateFieldName_Valid(t *testing.T) {
+	validNames := []string{
+		"name",
+		"user_name",
+		"type.field",
+		"age",
+		"email_address",
+	}
+	for _, name := range validNames {
+		if err := validateFieldName(name); err != nil {
+			t.Errorf("validateFieldName(%q) = %v, want nil", name, err)
+		}
+	}
+}
+
+func TestValidateFieldName_Invalid(t *testing.T) {
+	invalidNames := []string{
+		"",
+		"name/path",
+		"name\\path",
+		"name:name",
+		"name*",
+		"name?",
+		"name\"test",
+		"name<test>",
+		"name|test",
+		"name\x00null",
+		"name\x01ctrl",
+	}
+	for _, name := range invalidNames {
+		if err := validateFieldName(name); err == nil {
+			t.Errorf("validateFieldName(%q) should return error", name)
+		}
+	}
+}
+
+func TestValidateFieldName_TooLong(t *testing.T) {
+	longName := ""
+	for i := 0; i < 300; i++ {
+		longName += "a"
+	}
+	if err := validateFieldName(longName); err == nil {
+		t.Error("validateFieldName should reject names longer than 256 bytes")
+	}
+}
+
+func TestParseWhere_InjectionAttempt(t *testing.T) {
+	// Field names with special characters should be rejected
+	_, err := parseWhere("name/path == test")
+	if err == nil {
+		t.Error("parseWhere should reject field names with slashes")
+	}
+
+	_, err = parseWhere("name\\path == test")
+	if err == nil {
+		t.Error("parseWhere should reject field names with backslashes")
+	}
+
+	_, err = parseWhere("name:colon == test")
+	if err == nil {
+		t.Error("parseWhere should reject field names with colons")
+	}
+}
+
 var _ = reflect.ValueOf

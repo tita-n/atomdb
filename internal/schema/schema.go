@@ -126,6 +126,14 @@ func validateDefaultValue(val interface{}) error {
 		if len(s) > MaxDefaultLen {
 			return fmt.Errorf("default value exceeds maximum length of %d bytes", MaxDefaultLen)
 		}
+		for i, r := range s {
+			if r == 0 {
+				return fmt.Errorf("default value contains null byte at position %d", i)
+			}
+			if unicode.IsControl(r) && r != '\t' && r != '\n' && r != '\r' {
+				return fmt.Errorf("default value contains control character at position %d", i)
+			}
+		}
 	}
 	return nil
 }
@@ -523,6 +531,11 @@ func (s *Schema) loadFromSerializable(schema serializableSchema) error {
 			}
 			if err := validateDefaultValue(f.Default); err != nil {
 				return fmt.Errorf("field %q: %w", f.Name, err)
+			}
+			if f.RefType != "" {
+				if err := validateIdentifier(f.RefType); err != nil {
+					return fmt.Errorf("field %q has invalid ref_type %q: %w", f.Name, f.RefType, err)
+				}
 			}
 			fields = append(fields, FieldDef{
 				Name:     f.Name,

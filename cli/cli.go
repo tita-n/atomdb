@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"sort"
@@ -8,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/tita-n/atomdb/internal/atom"
 	"github.com/tita-n/atomdb/internal/query"
@@ -177,7 +180,7 @@ func cmdInsert(db *DB, args []string) error {
 	}
 
 	// Generate entity ID
-	entity := fmt.Sprintf("%s:%d", typeName, len(validated))
+	entity := fmt.Sprintf("%s:%s", typeName, generateSecureID())
 
 	// Check if we need a better ID (use a name-like field if present)
 	for _, idField := range []string{"name", "id", "email", "title"} {
@@ -188,19 +191,9 @@ func cmdInsert(db *DB, args []string) error {
 		}
 	}
 
-	// Detect duplicate entity IDs (same natural key already exists)
-	if db.Store.Exists(entity, "name") || db.Store.Exists(entity, "id") ||
-		db.Store.Exists(entity, "email") || db.Store.Exists(entity, "title") ||
-		db.Store.Exists(entity, "__type") {
-		return fmt.Errorf("duplicate entity: %q already exists", entity)
-	}
-
-	// Store each field as an atom
-	for attr, val := range validated {
-		valType := inferType(val)
-		if err := db.Store.Set(entity, attr, val, valType); err != nil {
-			return fmt.Errorf("failed to store %s.%s: %w", entity, attr, err)
-		}
+	// Atomically insert with duplicate detection (race-safe)
+	if err := db.Store.InsertIfNotExists(entity, validated, inferType); err != nil {
+		return err
 	}
 
 	fmt.Printf("Inserted: %s (%d fields)\n", entity, len(validated))
@@ -539,6 +532,19 @@ func cmdSet(s *store.AtomStore, args []string) error {
 		return fmt.Errorf("usage: set <entity> <attribute> <value> <type>")
 	}
 	entity, attribute, rawValue, valueType := args[0], args[1], args[2], args[3]
+
+	// Validate entity and attribute names
+	if err := validateName(entity); err != nil {
+		return fmt.Errorf("invalid entity name: %w", err)
+	}
+	if err := validateName(attribute); err != nil {
+		return fmt.Errorf("invalid attribute name: %w", err)
+	}
+	// Validate value type
+	if err := validateValueType(valueType); err != nil {
+		return err
+	}
+
 	value, err := parseRawValue(rawValue, valueType)
 	if err != nil {
 		return err
@@ -765,7 +771,9 @@ func cmdCreate(db *DB, args []string) error {
 		}
 		typeName := parts[0]
 		fieldName := parts[1]
-		db.Store.CreateIndex(typeName, fieldName)
+		if err := db.Store.CreateIndex(typeName, fieldName); err != nil {
+			return err
+		}
 		fmt.Printf("Index created: %s.%s\n", typeName, fieldName)
 		return nil
 	}
@@ -775,7 +783,9 @@ func cmdCreate(db *DB, args []string) error {
 	fieldPart = strings.TrimSuffix(fieldPart, ")")
 	fieldName := strings.TrimSpace(fieldPart)
 
-	db.Store.CreateIndex(typeName, fieldName)
+	if err := db.Store.CreateIndex(typeName, fieldName); err != nil {
+		return err
+	}
 	fmt.Printf("Index created: %s.%s\n", typeName, fieldName)
 	return nil
 }
@@ -841,6 +851,38 @@ func parseRawVal(raw string) interface{} {
 	return raw
 }
 
+// validateName checks that a name (entity/attribute) contains only safe characters.
+func validateName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name cannot be empty")
+	}
+	if len(name) > 1024 {
+		return fmt.Errorf("name too long (max 1024 bytes)")
+	}
+	for i, r := range name {
+		if unicode.IsControl(r) && r != '\t' {
+			return fmt.Errorf("control character at position %d", i)
+		}
+		if r == '\u2028' || r == '\u2029' {
+			return fmt.Errorf("Unicode line separator at position %d", i)
+		}
+		if r == '/' || r == '\\' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+			return fmt.Errorf("unsafe character %q at position %d", r, i)
+		}
+	}
+	return nil
+}
+
+// validateValueType checks that the value type is known.
+func validateValueType(t string) error {
+	switch strings.ToLower(t) {
+	case "string", "number", "boolean", "bool", "ref", "timestamp", "deleted":
+		return nil
+	default:
+		return fmt.Errorf("unknown value type %q", t)
+	}
+}
+
 func toFloatVal(v interface{}) float64 {
 	switch n := v.(type) {
 	case float64:
@@ -887,15 +929,31 @@ func inferType(v interface{}) string {
 func sanitizeEntityIDValue(v interface{}) string {
 	switch val := v.(type) {
 	case string:
-		safe := strings.ReplaceAll(val, ":", "_")
-		safe = strings.ReplaceAll(safe, "/", "_")
-		safe = strings.ReplaceAll(safe, "\\", "_")
-		safe = strings.ReplaceAll(safe, "\n", "_")
-		safe = strings.ReplaceAll(safe, "\r", "_")
-		if len(safe) > 256 {
-			safe = safe[:256]
+		var safe strings.Builder
+		safe.Grow(len(val))
+		for _, r := range val {
+			if unicode.IsControl(r) && r != '\t' {
+				safe.WriteRune('_')
+				continue
+			}
+			if r == '\u2028' || r == '\u2029' {
+				safe.WriteRune('_')
+				continue
+			}
+			if r == '/' || r == '\\' || r == ':' || r == '*' || r == '?' || r == '"' || r == '<' || r == '>' || r == '|' {
+				safe.WriteRune('_')
+				continue
+			}
+			safe.WriteRune(r)
 		}
-		return safe
+		result := safe.String()
+		if len(result) > 256 {
+			result = result[:256]
+		}
+		if result == "" {
+			return generateSecureID()
+		}
+		return result
 	case float64:
 		return fmt.Sprintf("n%d", int(val))
 	case int:
@@ -908,8 +966,17 @@ func sanitizeEntityIDValue(v interface{}) string {
 		}
 		return "false"
 	default:
-		return "unknown"
+		return generateSecureID()
 	}
+}
+
+// generateSecureID creates a cryptographically random 8-byte hex ID.
+func generateSecureID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("x%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 func printHelp() {

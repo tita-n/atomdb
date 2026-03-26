@@ -77,52 +77,72 @@ func sanitizePath(p string) (string, error) {
 		return "", fmt.Errorf("invalid database path: contains null byte")
 	}
 
-	if filepath.IsAbs(p) {
-		cleaned := filepath.Clean(p)
-		if strings.Contains(cleaned, "..") {
-			return "", fmt.Errorf("invalid database path: must not contain '..'")
+	// Reject control characters (except tab which shouldn't be in paths anyway)
+	for _, r := range p {
+		if r < 32 && r != '\t' {
+			return "", fmt.Errorf("invalid database path: contains control character")
 		}
-		return cleaned, nil
+		if r == 127 {
+			return "", fmt.Errorf("invalid database path: contains DEL character")
+		}
 	}
 
+	// Reject paths with ".." before any cleaning
 	if strings.Contains(p, "..") {
 		return "", fmt.Errorf("invalid database path: must not contain '..'")
 	}
 
-	p = filepath.Clean(p)
+	cleaned := filepath.Clean(p)
 
-	if err := validateDirPath(p); err != nil {
+	// Reject bare drive letters like "C:" without separator
+	if len(cleaned) >= 2 && cleaned[1] == ':' && (len(cleaned) == 2 || (cleaned[2] != '\\' && cleaned[2] != '/')) {
+		return "", fmt.Errorf("invalid database path: drive-relative path not allowed")
+	}
+
+	// Resolve to absolute path
+	absPath, err := filepath.Abs(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("cannot resolve path: %w", err)
+	}
+
+	// Re-check ".." after absolute resolution
+	if strings.Contains(absPath, "..") {
+		return "", fmt.Errorf("invalid database path: must not contain '..'")
+	}
+
+	if err := validateDirPath(absPath); err != nil {
 		return "", fmt.Errorf("invalid database path: %w", err)
 	}
 
-	return p, nil
+	return cleaned, nil
 }
 
 func validateDirPath(p string) error {
-	// On Windows, resolve to absolute and verify it's within expected bounds
-	absPath, err := filepath.Abs(p)
-	if err != nil {
-		return fmt.Errorf("cannot resolve path: %w", err)
-	}
-
-	// Check for Windows drive letter root escape (e.g., C:foo -> C:\currentdir\foo -> can reach C:\)
-	// The cleaned path should not start with a bare drive like "C:" without a separator
-	cleaned := filepath.Clean(p)
-	if len(cleaned) >= 2 && cleaned[1] == ':' && (len(cleaned) == 2 || cleaned[2] != '\\' && cleaned[2] != '/') {
-		return fmt.Errorf("path escapes root directory")
-	}
-
-	// Verify the absolute path doesn't have unexpected drive roots
-	if runtime.GOOS == "windows" {
-		vol := filepath.VolumeName(absPath)
-		if vol != "" && !strings.HasPrefix(cleaned, vol) && !strings.HasPrefix(cleaned, "."+string(filepath.Separator)) {
-			// Path like "C:foo" where working dir is on different drive is suspicious
-			if strings.HasPrefix(cleaned, ".:") || (len(cleaned) >= 3 && cleaned[0] != '.' && cleaned[1] == ':' && cleaned[2] != '\\' && cleaned[2] != '/') {
-				return fmt.Errorf("drive-relative path not allowed")
-			}
+	// Convert to absolute path if not already
+	absPath := p
+	if !filepath.IsAbs(p) {
+		var err error
+		absPath, err = filepath.Abs(p)
+		if err != nil {
+			return fmt.Errorf("cannot resolve path: %w", err)
 		}
 	}
 
+	// Verify the absolute path doesn't escape via drive-relative tricks on Windows
+	if runtime.GOOS == "windows" {
+		vol := filepath.VolumeName(absPath)
+		if vol != "" {
+			// Ensure path starts with its volume name followed by separator
+			rest := absPath[len(vol):]
+			if len(rest) > 0 && rest[0] != '\\' && rest[0] != '/' {
+				return fmt.Errorf("drive-relative path not allowed")
+			}
+			// Reject UNC path smuggling
+			if strings.HasPrefix(absPath, `\\?\`) || strings.HasPrefix(absPath, `\\.\`) {
+				return fmt.Errorf("device path not allowed")
+			}
+		}
+	}
 	return nil
 }
 
@@ -142,8 +162,35 @@ func sanitizeError(err error) string {
 	msg = sb.String()
 	msg = strings.ReplaceAll(msg, "\n", " ")
 	msg = strings.ReplaceAll(msg, "\r", " ")
+	// Strip absolute file paths to prevent information leakage
+	msg = stripFilePaths(msg)
 	if len(msg) > 200 {
 		msg = msg[:200] + "..."
 	}
 	return msg
+}
+
+// stripFilePaths removes absolute file paths from error messages.
+func stripFilePaths(s string) string {
+	// Match Windows drive paths like C:\... or D:/...
+	for i := 0; i < len(s)-2; i++ {
+		if ((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) && s[i+1] == ':' && (s[i+2] == '\\' || s[i+2] == '/') {
+			end := i + 3
+			for end < len(s) && s[end] != ' ' && s[end] != '\t' && s[end] != '"' && s[end] != '\'' {
+				end++
+			}
+			s = s[:i] + "[path]" + s[end:]
+		}
+	}
+	// Match Unix absolute paths
+	for i := 0; i < len(s)-1; i++ {
+		if s[i] == '/' && i+1 < len(s) && s[i+1] != ' ' && s[i+1] != '/' {
+			end := i + 1
+			for end < len(s) && s[end] != ' ' && s[end] != '\t' && s[end] != '"' && s[end] != '\'' {
+				end++
+			}
+			s = s[:i] + "[path]" + s[end:]
+		}
+	}
+	return s
 }

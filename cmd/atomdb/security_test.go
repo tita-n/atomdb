@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -63,6 +64,43 @@ func TestSanitizeError_ControlChars(t *testing.T) {
 	}
 }
 
+func TestSanitizeError_FilePathStripping(t *testing.T) {
+	testCases := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{
+			name:    "Windows path stripped",
+			input:   "failed to open C:\\Users\\test\\data.db",
+			wantErr: true,
+		},
+		{
+			name:    "Unix path stripped",
+			input:   "failed to open /home/user/data.db",
+			wantErr: true,
+		},
+		{
+			name:    "No path in message",
+			input:   "invalid query syntax",
+			wantErr: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &testError{msg: tc.input}
+			got := sanitizeError(err)
+			if tc.wantErr && strings.Contains(got, "C:\\") {
+				t.Errorf("sanitizeError() should have stripped Windows path, got %q", got)
+			}
+			if tc.wantErr && strings.Contains(got, "/home/") {
+				t.Errorf("sanitizeError() should have stripped Unix path, got %q", got)
+			}
+		})
+	}
+}
+
 type testError struct {
 	msg string
 }
@@ -111,6 +149,27 @@ func TestSanitizePath_InvalidPaths(t *testing.T) {
 	}
 }
 
+func TestSanitizePath_NullByte(t *testing.T) {
+	_, err := sanitizePath("data\x00.db")
+	if err == nil {
+		t.Error("sanitizePath should reject null bytes")
+	}
+}
+
+func TestSanitizePath_ControlChars(t *testing.T) {
+	_, err := sanitizePath("data\x01.db")
+	if err == nil {
+		t.Error("sanitizePath should reject control characters")
+	}
+}
+
+func TestSanitizePath_BareDriveLetter(t *testing.T) {
+	_, err := sanitizePath("C:")
+	if err == nil {
+		t.Error("sanitizePath should reject bare drive letters")
+	}
+}
+
 func TestValidateDirPath(t *testing.T) {
 	validPaths := []string{
 		"data",
@@ -124,6 +183,20 @@ func TestValidateDirPath(t *testing.T) {
 		err := validateDirPath(p)
 		if err != nil {
 			t.Errorf("validateDirPath(%q) returned error: %v", p, err)
+		}
+	}
+}
+
+func TestValidateDirPath_DevicePath(t *testing.T) {
+	invalidPaths := []string{
+		`\\?\C:\data`,
+		`\\.\pipe\test`,
+	}
+
+	for _, p := range invalidPaths {
+		err := validateDirPath(p)
+		if err == nil {
+			t.Errorf("validateDirPath(%q) should reject device paths", p)
 		}
 	}
 }
